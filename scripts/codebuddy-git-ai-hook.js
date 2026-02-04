@@ -1,36 +1,7 @@
 #!/usr/bin/env node
 /**
- * CodeBuddy -> git-ai agent-v1 适配脚本 (Node.js 版本)
- *
- * 将 CodeBuddy 的 hook 数据转换为 git-ai agent-v1 格式，
- * 实现 AI 代码归属追踪。
- *
- * 使用方法:
- * 1. 确保 git-ai 已安装并在 PATH 中
- * 2. 在项目的 .codebuddy/settings.json 中配置 hooks
- * 3. 脚本会自动将 CodeBuddy 的数据转换为 git-ai 格式
- *
- * 配置示例 (.codebuddy/settings.json):
- * {
- *   "hooks": {
- *     "PreToolUse": [{
- *       "matcher": "replace_in_file|write_to_file|create_file",
- *       "hooks": [{
- *         "type": "command",
- *         "command": "node /path/to/codebuddy-git-ai-hook.js",
- *         "timeout": 30
- *       }]
- *     }],
- *     "PostToolUse": [{
- *       "matcher": "replace_in_file|write_to_file|create_file",
- *       "hooks": [{
- *         "type": "command",
- *         "command": "node /path/to/codebuddy-git-ai-hook.js",
- *         "timeout": 30
- *       }]
- *     }]
- *   }
- * }
+ * CodeBuddy -> git-ai 适配脚本
+ * 将 CodeBuddy 的 hook 数据转换为 git-ai agent-v1 格式
  */
 
 const { spawn, execSync } = require('child_process');
@@ -212,13 +183,127 @@ function getEditedFilepaths(hookData) {
 }
 
 /**
+ * 从 CodeBuddy IDE 的会话历史中提取模型名
+ * 路径格式: ~/Library/Application Support/CodeBuddyExtension/Data/{user_id}/CodeBuddyIDE/{user_id}/history/{workspace_hash}/{session_id}/messages/*.json
+ * @param {string} sessionId - 会话 ID
+ * @returns {string|null} - 模型名或 null
+ */
+function extractModelFromCodeBuddyIDE(sessionId) {
+  if (!sessionId) {
+    return null;
+  }
+  
+  try {
+    const homeDir = process.env.HOME || '';
+    const dataDir = path.join(homeDir, 'Library', 'Application Support', 'CodeBuddyExtension', 'Data');
+    
+    if (!fs.existsSync(dataDir)) {
+      log(`CodeBuddyExtension Data dir not found: ${dataDir}`);
+      return null;
+    }
+    
+    // 遍历 Data 目录下的用户目录
+    const userDirs = fs.readdirSync(dataDir).filter(d => {
+      const fullPath = path.join(dataDir, d);
+      return fs.statSync(fullPath).isDirectory() && d !== 'Public' && d !== 'default';
+    });
+    
+    for (const userId of userDirs) {
+      // 路径: {userId}/CodeBuddyIDE/{userId}/history/
+      const historyBase = path.join(dataDir, userId, 'CodeBuddyIDE', userId, 'history');
+      
+      if (!fs.existsSync(historyBase)) {
+        continue;
+      }
+      
+      // 遍历 workspace hash 目录
+      const workspaceDirs = fs.readdirSync(historyBase).filter(d => {
+        const fullPath = path.join(historyBase, d);
+        return fs.statSync(fullPath).isDirectory();
+      });
+      
+      for (const workspaceHash of workspaceDirs) {
+        // 检查是否存在该 session
+        const sessionDir = path.join(historyBase, workspaceHash, sessionId);
+        
+        if (!fs.existsSync(sessionDir)) {
+          continue;
+        }
+        
+        const messagesDir = path.join(sessionDir, 'messages');
+        
+        if (!fs.existsSync(messagesDir)) {
+          continue;
+        }
+        
+        log(`Found session messages dir: ${messagesDir}`);
+        
+        // 读取最近的消息文件找模型信息
+        const messageFiles = fs.readdirSync(messagesDir)
+          .filter(f => f.endsWith('.json'))
+          .map(f => ({
+            name: f,
+            path: path.join(messagesDir, f),
+            mtime: fs.statSync(path.join(messagesDir, f)).mtime
+          }))
+          .sort((a, b) => b.mtime - a.mtime); // 按修改时间降序
+        
+        for (const msgFile of messageFiles) {
+          try {
+            const content = fs.readFileSync(msgFile.path, 'utf-8');
+            const message = JSON.parse(content);
+            
+            // 模型信息在 extra 字段（是 JSON 字符串）
+            if (message.extra) {
+              const extra = typeof message.extra === 'string' 
+                ? JSON.parse(message.extra) 
+                : message.extra;
+              
+              if (extra.modelId) {
+                log(`Found model from IDE history: ${extra.modelId}`);
+                return extra.modelId;
+              }
+              if (extra.modelName) {
+                log(`Found model name from IDE history: ${extra.modelName}`);
+                return extra.modelName;
+              }
+            }
+          } catch (e) {
+            // 忽略单个文件的解析错误
+            continue;
+          }
+        }
+      }
+    }
+    
+    return null;
+  } catch (e) {
+    log(`Error extracting model from CodeBuddy IDE: ${e.message}`);
+    return null;
+  }
+}
+
+/**
  * 获取模型名称
+ * 优先级：hook 数据 > 环境变量 > IDE 会话历史
  */
 function getModelName(hookData) {
-  return hookData.model || 
-         hookData.model_name || 
-         process.env.CODEBUDDY_MODEL || 
-         'codebuddy';
+  // 1. hook 数据中直接提供
+  if (hookData.model) return hookData.model;
+  if (hookData.model_name) return hookData.model_name;
+  
+  // 2. 环境变量
+  if (process.env.CODEBUDDY_MODEL) return process.env.CODEBUDDY_MODEL;
+  
+  // 3. 从 IDE 会话历史中提取（最准确）
+  const sessionId = hookData.session_id;
+  if (sessionId) {
+    const model = extractModelFromCodeBuddyIDE(sessionId);
+    if (model) return model;
+  }
+  
+  // 4. 默认值
+  return 'codebuddy';
 }
 
 /**
@@ -233,18 +318,8 @@ function getConversationId(hookData) {
 
 /**
  * 构建 transcript
- * 
- * git-ai agent-v1 要求的格式:
- * {
- *   "messages": [
- *     {"type": "user", "text": "...", "timestamp": "..."},
- *     {"type": "assistant", "text": "...", "timestamp": "..."},
- *     {"type": "tool_use", "name": "...", "input": {...}, "timestamp": "..."}
- *   ]
- * }
  */
 function buildTranscript(hookData) {
-  const messages = [];
   const timestamp = new Date().toISOString();
   
   // 如果已有 transcript，直接返回
@@ -252,51 +327,12 @@ function buildTranscript(hookData) {
     return hookData.transcript;
   }
   
-  // 如果有 transcript_path，尝试读取
-  if (hookData.transcript_path && fs.existsSync(hookData.transcript_path)) {
-    try {
-      const content = fs.readFileSync(hookData.transcript_path, 'utf-8');
-      // 可能是 JSONL 格式
-      if (hookData.transcript_path.endsWith('.jsonl')) {
-        for (const line of content.split('\n')) {
-          if (!line.trim()) continue;
-          try {
-            const entry = JSON.parse(line);
-            const msgType = entry.type || 'unknown';
-            if (msgType === 'human' || msgType === 'user') {
-              messages.push({
-                type: 'user',
-                text: entry.message?.content || entry.text || '',
-                timestamp: entry.timestamp || timestamp
-              });
-            } else if (msgType === 'assistant' || msgType === 'ai') {
-              messages.push({
-                type: 'assistant',
-                text: entry.message?.content || entry.text || '',
-                timestamp: entry.timestamp || timestamp
-              });
-            }
-          } catch {
-            continue;
-          }
-        }
-      } else {
-        // 尝试作为 JSON 读取
-        const data = JSON.parse(content);
-        if (data.messages) {
-          return data;
-        }
-      }
-    } catch (e) {
-      log(`Failed to read transcript: ${e.message}`);
-    }
-  }
-  
-  // 至少添加一个工具使用记录
-  const toolName = hookData.tool_name || 'unknown';
+  // 构建工具使用记录
+  const messages = [];
+  const toolName = hookData.tool_name;
   const toolInput = hookData.tool_input || {};
   
-  if (toolName !== 'unknown') {
+  if (toolName) {
     messages.push({
       type: 'tool_use',
       name: toolName,
