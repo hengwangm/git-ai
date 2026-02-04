@@ -183,24 +183,18 @@ function getEditedFilepaths(hookData) {
 }
 
 /**
- * 从 CodeBuddy IDE 的会话历史中提取模型名
- * 路径格式: ~/Library/Application Support/CodeBuddyExtension/Data/{user_id}/CodeBuddyIDE/{user_id}/history/{workspace_hash}/{session_id}/messages/*.json
+ * 查找 CodeBuddy IDE 会话的 messages 目录
  * @param {string} sessionId - 会话 ID
- * @returns {string|null} - 模型名或 null
+ * @returns {string|null} - messages 目录路径或 null
  */
-function extractModelFromCodeBuddyIDE(sessionId) {
-  if (!sessionId) {
-    return null;
-  }
+function findSessionMessagesDir(sessionId) {
+  if (!sessionId) return null;
   
   try {
     const homeDir = process.env.HOME || '';
     const dataDir = path.join(homeDir, 'Library', 'Application Support', 'CodeBuddyExtension', 'Data');
     
-    if (!fs.existsSync(dataDir)) {
-      log(`CodeBuddyExtension Data dir not found: ${dataDir}`);
-      return null;
-    }
+    if (!fs.existsSync(dataDir)) return null;
     
     // 遍历 Data 目录下的用户目录
     const userDirs = fs.readdirSync(dataDir).filter(d => {
@@ -209,77 +203,154 @@ function extractModelFromCodeBuddyIDE(sessionId) {
     });
     
     for (const userId of userDirs) {
-      // 路径: {userId}/CodeBuddyIDE/{userId}/history/
       const historyBase = path.join(dataDir, userId, 'CodeBuddyIDE', userId, 'history');
+      if (!fs.existsSync(historyBase)) continue;
       
-      if (!fs.existsSync(historyBase)) {
-        continue;
-      }
-      
-      // 遍历 workspace hash 目录
       const workspaceDirs = fs.readdirSync(historyBase).filter(d => {
         const fullPath = path.join(historyBase, d);
         return fs.statSync(fullPath).isDirectory();
       });
       
       for (const workspaceHash of workspaceDirs) {
-        // 检查是否存在该 session
-        const sessionDir = path.join(historyBase, workspaceHash, sessionId);
-        
-        if (!fs.existsSync(sessionDir)) {
-          continue;
-        }
-        
-        const messagesDir = path.join(sessionDir, 'messages');
-        
-        if (!fs.existsSync(messagesDir)) {
-          continue;
-        }
-        
-        log(`Found session messages dir: ${messagesDir}`);
-        
-        // 读取最近的消息文件找模型信息
-        const messageFiles = fs.readdirSync(messagesDir)
-          .filter(f => f.endsWith('.json'))
-          .map(f => ({
-            name: f,
-            path: path.join(messagesDir, f),
-            mtime: fs.statSync(path.join(messagesDir, f)).mtime
-          }))
-          .sort((a, b) => b.mtime - a.mtime); // 按修改时间降序
-        
-        for (const msgFile of messageFiles) {
-          try {
-            const content = fs.readFileSync(msgFile.path, 'utf-8');
-            const message = JSON.parse(content);
-            
-            // 模型信息在 extra 字段（是 JSON 字符串）
-            if (message.extra) {
-              const extra = typeof message.extra === 'string' 
-                ? JSON.parse(message.extra) 
-                : message.extra;
-              
-              if (extra.modelId) {
-                log(`Found model from IDE history: ${extra.modelId}`);
-                return extra.modelId;
-              }
-              if (extra.modelName) {
-                log(`Found model name from IDE history: ${extra.modelName}`);
-                return extra.modelName;
-              }
-            }
-          } catch (e) {
-            // 忽略单个文件的解析错误
-            continue;
-          }
+        const messagesDir = path.join(historyBase, workspaceHash, sessionId, 'messages');
+        if (fs.existsSync(messagesDir)) {
+          log(`Found session messages dir: ${messagesDir}`);
+          return messagesDir;
         }
       }
     }
-    
     return null;
   } catch (e) {
-    log(`Error extracting model from CodeBuddy IDE: ${e.message}`);
+    log(`Error finding session messages dir: ${e.message}`);
     return null;
+  }
+}
+
+/**
+ * 从 CodeBuddy IDE 的会话历史中提取模型名
+ * @param {string} sessionId - 会话 ID
+ * @returns {string|null} - 模型名或 null
+ */
+function extractModelFromCodeBuddyIDE(sessionId) {
+  const messagesDir = findSessionMessagesDir(sessionId);
+  if (!messagesDir) return null;
+  
+  try {
+    const messageFiles = fs.readdirSync(messagesDir)
+      .filter(f => f.endsWith('.json'))
+      .map(f => ({
+        path: path.join(messagesDir, f),
+        mtime: fs.statSync(path.join(messagesDir, f)).mtime
+      }))
+      .sort((a, b) => b.mtime - a.mtime);
+    
+    for (const msgFile of messageFiles) {
+      try {
+        const content = fs.readFileSync(msgFile.path, 'utf-8');
+        const message = JSON.parse(content);
+        
+        if (message.extra) {
+          const extra = typeof message.extra === 'string' 
+            ? JSON.parse(message.extra) : message.extra;
+          
+          if (extra.modelId) {
+            log(`Found model from IDE history: ${extra.modelId}`);
+            return extra.modelId;
+          }
+        }
+      } catch { continue; }
+    }
+    return null;
+  } catch (e) {
+    log(`Error extracting model: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * 从 IDE 会话历史构建完整的 transcript
+ * @param {string} sessionId - 会话 ID
+ * @param {number} maxMessages - 最大消息数量（默认 50）
+ * @returns {object} - { messages: [...] }
+ */
+function buildTranscriptFromIDE(sessionId, maxMessages = 50) {
+  const messagesDir = findSessionMessagesDir(sessionId);
+  if (!messagesDir) return { messages: [] };
+  
+  try {
+    const messageFiles = fs.readdirSync(messagesDir)
+      .filter(f => f.endsWith('.json'))
+      .map(f => ({
+        path: path.join(messagesDir, f),
+        mtime: fs.statSync(path.join(messagesDir, f)).mtime
+      }))
+      .sort((a, b) => a.mtime - b.mtime); // 按时间升序
+    
+    const messages = [];
+    const recentFiles = messageFiles.slice(-maxMessages);
+    
+    for (const msgFile of recentFiles) {
+      try {
+        const content = fs.readFileSync(msgFile.path, 'utf-8');
+        const msg = JSON.parse(content);
+        const timestamp = msgFile.mtime.toISOString();
+        
+        if (msg.role === 'user') {
+          // 提取用户输入
+          const extra = msg.extra ? (typeof msg.extra === 'string' ? JSON.parse(msg.extra) : msg.extra) : {};
+          let text = '';
+          
+          // 优先从 sourceContentBlocks 获取原始用户输入
+          if (extra.sourceContentBlocks && extra.sourceContentBlocks[0]) {
+            text = extra.sourceContentBlocks[0].text || '';
+          } else if (msg.message) {
+            // 从 message 解析
+            try {
+              const msgData = typeof msg.message === 'string' ? JSON.parse(msg.message) : msg.message;
+              if (msgData.content && msgData.content[0] && msgData.content[0].text) {
+                // 尝试提取 <user_query> 中的内容
+                const fullText = msgData.content[0].text;
+                const userQueryMatch = fullText.match(/<user_query>\n?([\s\S]*?)\n?<\/user_query>/);
+                text = userQueryMatch ? userQueryMatch[1].trim() : fullText.substring(0, 500);
+              }
+            } catch { }
+          }
+          
+          if (text) {
+            messages.push({ type: 'user', text, timestamp });
+          }
+          
+        } else if (msg.role === 'assistant') {
+          // 提取 AI 回复
+          let text = '';
+          
+          if (msg.message) {
+            try {
+              const msgData = typeof msg.message === 'string' ? JSON.parse(msg.message) : msg.message;
+              if (msgData.content) {
+                // 只提取文本部分，忽略 tool-call
+                for (const item of msgData.content) {
+                  if (item.type === 'text' && item.text) {
+                    text += item.text + '\n';
+                  }
+                }
+              }
+            } catch { }
+          }
+          
+          if (text.trim()) {
+            messages.push({ type: 'assistant', text: text.trim().substring(0, 2000), timestamp });
+          }
+        }
+        // 注意：tool 消息不包含在 transcript 中，因为 git-ai 只需要 user/assistant/tool_use
+      } catch { continue; }
+    }
+    
+    log(`Built transcript with ${messages.length} messages from IDE history`);
+    return { messages };
+  } catch (e) {
+    log(`Error building transcript: ${e.message}`);
+    return { messages: [] };
   }
 }
 
@@ -318,22 +389,26 @@ function getConversationId(hookData) {
 
 /**
  * 构建 transcript
+ * 优先从 IDE 会话历史构建完整的 user/assistant 消息，再添加当前 tool_use
  */
 function buildTranscript(hookData) {
   const timestamp = new Date().toISOString();
   
   // 如果已有 transcript，直接返回
-  if (hookData.transcript && hookData.transcript.messages) {
+  if (hookData.transcript && hookData.transcript.messages && hookData.transcript.messages.length > 0) {
     return hookData.transcript;
   }
   
-  // 构建工具使用记录
-  const messages = [];
+  // 从 IDE 会话历史构建 transcript
+  const sessionId = hookData.session_id;
+  const transcript = sessionId ? buildTranscriptFromIDE(sessionId, 30) : { messages: [] };
+  
+  // 添加当前工具使用记录
   const toolName = hookData.tool_name;
   const toolInput = hookData.tool_input || {};
   
   if (toolName) {
-    messages.push({
+    transcript.messages.push({
       type: 'tool_use',
       name: toolName,
       input: typeof toolInput === 'object' ? toolInput : {},
@@ -341,7 +416,7 @@ function buildTranscript(hookData) {
     });
   }
   
-  return { messages };
+  return transcript;
 }
 
 /**
