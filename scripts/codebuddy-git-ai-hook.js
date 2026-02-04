@@ -346,7 +346,11 @@ function buildTranscriptFromIDE(sessionId, maxMessages = 50) {
       } catch { continue; }
     }
     
-    log(`Built transcript with ${messages.length} messages from IDE history`);
+    // 统计消息类型
+    const userCount = messages.filter(m => m.type === 'user').length;
+    const assistantCount = messages.filter(m => m.type === 'assistant').length;
+    const toolCount = messages.filter(m => m.type === 'tool_use').length;
+    log(`Built transcript with ${messages.length} messages (user: ${userCount}, assistant: ${assistantCount}, tool: ${toolCount})`);
     return { messages };
   } catch (e) {
     log(`Error building transcript: ${e.message}`);
