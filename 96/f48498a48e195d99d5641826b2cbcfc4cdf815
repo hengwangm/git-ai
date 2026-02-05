@@ -1,0 +1,110 @@
+docs/install.sh
+  49e4e030818bd604 563,570-571
+test-hook-trigger.txt
+  49e4e030818bd604 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.42",
+  "base_commit_sha": "96f48498a48e195d99d5641826b2cbcfc4cdf815",
+  "prompts": {
+    "49e4e030818bd604": {
+      "agent_id": {
+        "tool": "codebuddy",
+        "id": "447a9e7abb9c4b2a894bdc8403e962e3",
+        "model": "claude-opus-4.5"
+      },
+      "human_author": "henrywwang <henrywwang@tencent.com>",
+      "messages": [
+        {
+          "type": "assistant",
+          "text": "-",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "-",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "现在让我看看 post_commit 是在哪里被调用的：",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "有数据！让我直接用 git commit：",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "-",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "-",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "完全没有任何 notes。让我查看 git-ai 的全局 git hooks 是否在工作：",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "还是没有 notes。让我查查 git-ai 的配置，看看 notes 是怎么写入的：",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "让我看看 `rebase_authorship.rs` 是怎么调用的：",
+          "timestamp": "2026-02-05T13:00:53.145Z"
+        },
+        {
+          "type": "assistant",
+          "text": "你说得对！项目里的 `.codebuddy/codebuddy-git-ai-hook.js` 已经有完整的适配逻辑了：\n- 使用 `agent-v1` 预设（不是 `claude`）\n- 自动从 filePath 推断 git 目录\n- 从 IDE 会话历史提取模型名\n- 构建完整的 transcript\n\n而 `docs/install.sh` 安装的是一个简化版本，没有这些适配逻辑。\n\n让我把正确的脚本复制到全局配置：",
+          "timestamp": "2026-02-05T13:00:53.146Z"
+        },
+        {
+          "type": "assistant",
+          "text": "需要开启 DEBUG 才有日志。先提交看看 notes：",
+          "timestamp": "2026-02-05T13:00:53.146Z"
+        },
+        {
+          "type": "assistant",
+          "text": "看到了！`src/commands/hooks/commit_hooks.rs` 是关键。让我看看：",
+          "timestamp": "2026-02-05T13:00:53.146Z"
+        },
+        {
+          "type": "assistant",
+          "text": "这说明 **git-ai 需要作为 git 的代理来运行**，即用 `git-ai commit` 而不是 `git commit`。只有这样，`commit_post_command_hook` 才会被调用来写入 notes。\n\n但是我们的使用场景是通过 CodeBuddy hooks 在文件编辑时调用 checkpoint，然后用普通的 `git commit` 提交。\n\n问题是：**普通的 `git commit` 不会触发 git-ai 的 post-commit hook 来写入 notes**。\n\n解决方案有两个：\n1. 配置 git alias，让 `git commit` 实际调用 `git-ai commit`\n2. 或者设置一个真正的 git post-commit hook 来调用 git-ai\n\n让我检查一下是否有相关配置：",
+          "timestamp": "2026-02-05T13:00:53.146Z"
+        },
+        {
+          "type": "assistant",
+          "text": "没有。我需要更新安装脚本，添加一个 post-commit hook 来处理 notes 写入。或者我们可以让全局的 `~/.git-hooks/post-commit` 调用 git-ai。\n\n**总结当前状态：**\n\n✅ **CodeBuddy hooks 已正常工作** - checkpoint 数据被正确记录\n✅ **适配脚本工作正常** - 从 IDE 历史提取模型名、构建 transcript\n❌ **git notes 没有写入** - 因为普通 `git commit` 不触发 git-ai 的 post-commit 处理\n\n**需要修复 `docs/install.sh`**：安装正确的适配脚本，并配置 git 使用 git-ai 来提交或添加 post-commit hook。",
+          "timestamp": "2026-02-05T13:00:53.146Z"
+        },
+        {
+          "type": "assistant",
+          "text": "让我看看 main.rs 或者命令处理：",
+          "timestamp": "2026-02-05T13:00:53.146Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "replace_in_file",
+          "input": {
+            "filePath": "/Users/wangheng/my/git-ai/test-hook-trigger.txt",
+            "old_str": "这"
+          },
+          "timestamp": "2026-02-05T13:02:27.078Z"
+        }
+      ],
+      "total_additions": 4,
+      "total_deletions": 2,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    }
+  }
+}
