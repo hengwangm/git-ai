@@ -1,0 +1,23 @@
+test-hook-trigger.txt
+  49e4e030818bd604 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.42",
+  "base_commit_sha": "8377b94b8cb120f30473a15fd85a3c8fd8ee8ef5",
+  "prompts": {
+    "49e4e030818bd604": {
+      "agent_id": {
+        "tool": "codebuddy",
+        "id": "447a9e7abb9c4b2a894bdc8403e962e3",
+        "model": "claude-opus-4.5"
+      },
+      "human_author": "henrywwang <henrywwang@tencent.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
