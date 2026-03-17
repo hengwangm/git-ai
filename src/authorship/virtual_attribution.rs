@@ -54,18 +54,18 @@ impl VirtualAttributions {
         }
 
         // After running blame, discover and load any missing prompts from blamed commits
-        virtual_attrs.discover_and_load_foreign_prompts()?;
+        virtual_attrs.discover_and_load_foreign_prompts().await?;
 
         Ok(virtual_attrs)
     }
 
     /// Discover and load prompts from blamed commits that aren't in our prompts map
-    fn discover_and_load_foreign_prompts(&mut self) -> Result<(), GitAiError> {
+    async fn discover_and_load_foreign_prompts(&mut self) -> Result<(), GitAiError> {
         use std::collections::HashSet;
 
         // Collect all unique author_ids from attributions
         let mut all_author_ids: HashSet<String> = HashSet::new();
-        for (_file_path, (char_attrs, _line_attrs)) in &self.attributions {
+        for (char_attrs, _line_attrs) in self.attributions.values() {
             for attr in char_attrs {
                 all_author_ids.insert(attr.author_id.clone());
             }
@@ -83,14 +83,14 @@ impl VirtualAttributions {
         }
 
         // Load prompts in parallel using the established MAX_CONCURRENT pattern
-        let prompts = smol::block_on(async { self.load_prompts_concurrent(&missing_ids).await })?;
+        let prompts = self.load_prompts_concurrent(&missing_ids).await?;
 
         // Insert loaded prompts into our map
         // Each prompt is associated with the commit it was found in
         for (id, commit_sha, prompt) in prompts {
             self.prompts
                 .entry(id)
-                .or_insert_with(BTreeMap::new)
+                .or_default()
                 .insert(commit_sha, prompt);
         }
 
@@ -151,17 +151,15 @@ impl VirtualAttributions {
         prompt_id: &str,
     ) -> Result<(String, crate::authorship::authorship_log::PromptRecord), GitAiError> {
         // Use git grep to search for the prompt ID in authorship notes
-        let shas = crate::git::refs::grep_ai_notes(&repo, &format!("\"{}\"", prompt_id))
+        let shas = crate::git::refs::grep_ai_notes(repo, &format!("\"{}\"", prompt_id))
             .unwrap_or_default();
 
         // Check the most recent commit with this prompt ID
-        if let Some(latest_sha) = shas.first() {
-            if let Ok(log) = crate::git::refs::get_reference_as_authorship_log_v3(&repo, latest_sha)
-            {
-                if let Some(prompt) = log.metadata.prompts.get(prompt_id) {
-                    return Ok((latest_sha.clone(), prompt.clone()));
-                }
-            }
+        if let Some(latest_sha) = shas.first()
+            && let Ok(log) = crate::git::refs::get_reference_as_authorship_log_v3(repo, latest_sha)
+            && let Some(prompt) = log.metadata.prompts.get(prompt_id)
+        {
+            return Ok((latest_sha.clone(), prompt.clone()));
         }
 
         Err(GitAiError::Generic(format!(
@@ -334,7 +332,7 @@ impl VirtualAttributions {
                 file_contents.insert(file_path.clone(), file_content.clone());
 
                 // Convert line attributions to character attributions
-                let char_attrs = line_attributions_to_attributions(&line_attrs, &file_content, 0);
+                let char_attrs = line_attributions_to_attributions(line_attrs, &file_content, 0);
                 attributions.insert(file_path.clone(), (char_attrs, line_attrs.clone()));
             }
         }
@@ -364,6 +362,7 @@ impl VirtualAttributions {
                     accepted_lines: 0,
                     overriden_lines: 0,
                     messages_url: None,
+                    custom_attributes: None,
                 };
 
                 prompts
@@ -380,6 +379,12 @@ impl VirtualAttributions {
 
             // Collect attributions from checkpoint entries
             for entry in &checkpoint.entries {
+                // Most human-only pre-commit entries carry no attribution data and can be skipped.
+                // This keeps post-commit work proportional to AI-relevant files.
+                if entry.line_attributions.is_empty() && entry.attributions.is_empty() {
+                    continue;
+                }
+
                 // Get the latest file content from working directory
                 if let Ok(workdir) = repo.workdir() {
                     let abs_path = workdir.join(&entry.file);
@@ -391,9 +396,22 @@ impl VirtualAttributions {
                     file_contents.insert(entry.file.clone(), file_content);
                 }
 
-                // Use the line attributions from the checkpoint
-                let line_attrs = entry.line_attributions.clone();
+                // Prefer persisted line attributions. Fall back to converting char attributions
+                // for compatibility with older checkpoint data.
                 let file_content = file_contents.get(&entry.file).cloned().unwrap_or_default();
+                let line_attrs = if entry.line_attributions.is_empty() {
+                    crate::authorship::attribution_tracker::attributions_to_line_attributions(
+                        &entry.attributions,
+                        &file_content,
+                    )
+                } else {
+                    entry.line_attributions.clone()
+                };
+
+                if line_attrs.is_empty() {
+                    continue;
+                }
+
                 let char_attrs = line_attributions_to_attributions(&line_attrs, &file_content, 0);
 
                 attributions.insert(entry.file.clone(), (char_attrs, line_attrs));
@@ -453,7 +471,14 @@ impl VirtualAttributions {
 
         // Step 3: Merge blame and checkpoint attributions
         // Checkpoint attributions should override blame attributions for overlapping lines
-        let final_state = checkpoint_va.file_contents.clone();
+        // Use the union of both VAs' file contents so files tracked only via blame/notes
+        // (committed AI work) are not dropped when INITIAL covers a disjoint set of files.
+        let mut final_state = checkpoint_va.file_contents.clone();
+        for (file, content) in &blame_va.file_contents {
+            final_state
+                .entry(file.clone())
+                .or_insert_with(|| content.clone());
+        }
         let merged_va = merge_attributions_favoring_first(checkpoint_va, blame_va, final_state)?;
 
         Ok(merged_va)
@@ -524,70 +549,53 @@ impl VirtualAttributions {
                 continue;
             }
 
-            // Group line attributions by author
-            let mut author_lines: HashMap<String, Vec<u32>> = HashMap::new();
+            // Group line attributions by author as intervals.
+            // This avoids expanding every range to individual line numbers.
+            let mut author_ranges: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
             for line_attr in line_attrs {
                 // Skip human attributions - we only track AI attributions
                 if line_attr.author_id == CheckpointKind::Human.to_str() {
                     continue;
                 }
 
-                for line in line_attr.start_line..=line_attr.end_line {
-                    author_lines
-                        .entry(line_attr.author_id.clone())
-                        .or_default()
-                        .push(line);
-                }
+                author_ranges
+                    .entry(line_attr.author_id.clone())
+                    .or_default()
+                    .push((line_attr.start_line, line_attr.end_line));
             }
 
             // Create attestation entries for each author
-            for (author_id, mut lines) in author_lines {
-                lines.sort();
-                lines.dedup();
-
-                if lines.is_empty() {
+            for (author_id, mut ranges) in author_ranges {
+                if ranges.is_empty() {
                     continue;
                 }
+                ranges.sort_by_key(|(start, end)| (*start, *end));
 
-                // Create line ranges
-                let mut ranges = Vec::new();
-                let mut range_start = lines[0];
-                let mut range_end = lines[0];
-
-                for &line in &lines[1..] {
-                    if line == range_end + 1 {
-                        range_end = line;
-                    } else {
-                        if range_start == range_end {
-                            ranges.push(crate::authorship::authorship_log::LineRange::Single(
-                                range_start,
-                            ));
-                        } else {
-                            ranges.push(crate::authorship::authorship_log::LineRange::Range(
-                                range_start,
-                                range_end,
-                            ));
+                let mut merged: Vec<(u32, u32)> = Vec::new();
+                for (start, end) in ranges {
+                    match merged.last_mut() {
+                        Some((_, last_end)) if start <= last_end.saturating_add(1) => {
+                            *last_end = (*last_end).max(end);
                         }
-                        range_start = line;
-                        range_end = line;
+                        _ => merged.push((start, end)),
                     }
                 }
 
-                // Add the last range
-                if range_start == range_end {
-                    ranges.push(crate::authorship::authorship_log::LineRange::Single(
-                        range_start,
-                    ));
-                } else {
-                    ranges.push(crate::authorship::authorship_log::LineRange::Range(
-                        range_start,
-                        range_end,
-                    ));
-                }
+                let line_ranges = merged
+                    .into_iter()
+                    .map(|(start, end)| {
+                        if start == end {
+                            crate::authorship::authorship_log::LineRange::Single(start)
+                        } else {
+                            crate::authorship::authorship_log::LineRange::Range(start, end)
+                        }
+                    })
+                    .collect();
 
                 // Create attestation entry
                 let entry = crate::authorship::authorship_log_serialization::AttestationEntry::new(
-                    author_id, ranges,
+                    author_id,
+                    line_ranges,
                 );
 
                 // Add to authorship log
@@ -638,6 +646,7 @@ fn collect_committed_hunks(
 /// Helper function to collect unstaged line ranges (lines in working directory but not in commit)
 /// Returns (unstaged_hunks, pure_insertion_hunks)
 /// pure_insertion_hunks contains lines that were purely inserted (old_count=0), not modifications
+#[allow(clippy::type_complexity)]
 fn collect_unstaged_hunks(
     repo: &Repository,
     commit_sha: &str,
@@ -670,34 +679,34 @@ fn collect_unstaged_hunks(
 
     // Check for untracked files in pathspecs that git diff didn't find
     // These are files that exist in the working directory but aren't tracked by git
-    if let Some(paths) = pathspecs {
-        if let Ok(workdir) = repo.workdir() {
-            for pathspec in paths {
-                // Skip if we already found this file in git diff
-                if unstaged_hunks.contains_key(pathspec) {
-                    continue;
-                }
+    if let Some(paths) = pathspecs
+        && let Ok(workdir) = repo.workdir()
+    {
+        for pathspec in paths {
+            // Skip if we already found this file in git diff
+            if unstaged_hunks.contains_key(pathspec) {
+                continue;
+            }
 
-                // Check if file exists in the commit - if it does, it's tracked and git diff should handle it
-                // Only process truly untracked files (files that don't exist in the commit tree)
-                if file_exists_in_commit(repo, commit_sha, pathspec).unwrap_or(false) {
-                    continue;
-                }
+            // Check if file exists in the commit - if it does, it's tracked and git diff should handle it
+            // Only process truly untracked files (files that don't exist in the commit tree)
+            if file_exists_in_commit(repo, commit_sha, pathspec).unwrap_or(false) {
+                continue;
+            }
 
-                // Check if file exists in working directory
-                let file_path = workdir.join(pathspec);
-                if file_path.exists() && file_path.is_file() {
-                    // Try to read the file
-                    if let Ok(content) = std::fs::read_to_string(&file_path) {
-                        // Count the lines - all lines are "unstaged" since the file is untracked
-                        let line_count = content.lines().count() as u32;
-                        if line_count > 0 {
-                            // Create a range covering all lines (1-indexed)
-                            let range = vec![LineRange::Range(1, line_count)];
-                            unstaged_hunks.insert(pathspec.clone(), range.clone());
-                            // Untracked files are pure insertions (the entire file is new)
-                            pure_insertion_hunks.insert(pathspec.clone(), range);
-                        }
+            // Check if file exists in working directory
+            let file_path = workdir.join(pathspec);
+            if file_path.exists() && file_path.is_file() {
+                // Try to read the file
+                if let Ok(content) = std::fs::read_to_string(&file_path) {
+                    // Count the lines - all lines are "unstaged" since the file is untracked
+                    let line_count = content.lines().count() as u32;
+                    if line_count > 0 {
+                        // Create a range covering all lines (1-indexed)
+                        let range = vec![LineRange::Range(1, line_count)];
+                        unstaged_hunks.insert(pathspec.clone(), range.clone());
+                        // Untracked files are pure insertions (the entire file is new)
+                        pure_insertion_hunks.insert(pathspec.clone(), range);
                     }
                 }
             }
@@ -861,7 +870,6 @@ impl VirtualAttributions {
                                 .entry(line_attr.author_id.clone())
                                 .or_default()
                                 .push(commit_line_num);
-                        } else {
                         }
                         // Note: Lines that are neither unstaged nor in committed_hunks are lines that
                         // already existed in the parent commit. They are discarded (not added to uncommitted).
@@ -1160,7 +1168,7 @@ impl VirtualAttributions {
 
             for source in prompt_sources {
                 if let Some(commits) = source.get(&prompt_id) {
-                    for (_commit_sha, prompt_record) in commits {
+                    for prompt_record in commits.values() {
                         all_records.push(prompt_record.clone());
                     }
                 }
@@ -1220,7 +1228,7 @@ impl VirtualAttributions {
 
         // Calculate accepted_lines: count lines in final attributions per session
         let mut session_accepted_lines: HashMap<String, u32> = HashMap::new();
-        for (_file_path, (_char_attrs, line_attrs)) in attributions {
+        for (_char_attrs, line_attrs) in attributions.values() {
             for line_attr in line_attrs {
                 // Skip human attributions - we only track AI prompt metrics
                 if line_attr.author_id == CheckpointKind::Human.to_str() {
@@ -1377,11 +1385,8 @@ pub fn merge_attributions_favoring_first(
             };
 
         // Merge: primary wins overlaps, secondary fills gaps
-        let merged_char_attrs = merge_char_attributions(
-            &transformed_primary,
-            &transformed_secondary,
-            final_content,
-        );
+        let merged_char_attrs =
+            merge_char_attributions(&transformed_primary, &transformed_secondary, final_content);
 
         // Convert to line attributions
         let merged_line_attrs =
@@ -1465,10 +1470,10 @@ pub fn restore_stashed_va(
     if let Ok(workdir) = repository.workdir() {
         for file_path in &stashed_files {
             let abs_path = workdir.join(file_path);
-            if abs_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                    working_files.insert(file_path.clone(), content);
-                }
+            if abs_path.exists()
+                && let Ok(content) = std::fs::read_to_string(&abs_path)
+            {
+                working_files.insert(file_path.clone(), content);
             }
         }
     }
@@ -1572,11 +1577,12 @@ fn merge_char_attributions(
 ) -> Vec<Attribution> {
     let content_len = content.len();
     if content_len == 0 {
-        return primary.iter().cloned().collect();
+        return primary.to_vec();
     }
 
     // Create coverage map for primary (byte-based).
     let mut covered = vec![false; content_len];
+    #[allow(clippy::needless_range_loop)]
     for attr in primary {
         for i in attr.start..attr.end.min(content_len) {
             covered[i] = true;
@@ -1603,6 +1609,7 @@ fn merge_char_attributions(
             let start = safe_start + rel_idx;
             let end = start + ch.len_utf8();
             let mut is_covered = false;
+            #[allow(clippy::needless_range_loop)]
             for i in start..end.min(content_len) {
                 if covered[i] {
                     is_covered = true;
@@ -1611,30 +1618,30 @@ fn merge_char_attributions(
             }
 
             if is_covered {
-                if let Some(range_start_idx) = range_start.take() {
-                    if range_start_idx < start {
-                        result.push(Attribution::new(
-                            range_start_idx,
-                            start,
-                            attr.author_id.clone(),
-                            attr.ts,
-                        ));
-                    }
+                if let Some(range_start_idx) = range_start.take()
+                    && range_start_idx < start
+                {
+                    result.push(Attribution::new(
+                        range_start_idx,
+                        start,
+                        attr.author_id.clone(),
+                        attr.ts,
+                    ));
                 }
             } else if range_start.is_none() {
                 range_start = Some(start);
             }
         }
 
-        if let Some(range_start_idx) = range_start.take() {
-            if range_start_idx < safe_end {
-                result.push(Attribution::new(
-                    range_start_idx,
-                    safe_end,
-                    attr.author_id.clone(),
-                    attr.ts,
-                ));
-            }
+        if let Some(range_start_idx) = range_start.take()
+            && range_start_idx < safe_end
+        {
+            result.push(Attribution::new(
+                range_start_idx,
+                safe_end,
+                attr.author_id.clone(),
+                attr.ts,
+            ));
         }
     }
 
@@ -1660,6 +1667,7 @@ fn ceil_char_boundary(content: &str, idx: usize) -> usize {
 }
 
 /// Compute attributions for a single file at a specific commit
+#[allow(clippy::type_complexity)]
 fn compute_attributions_for_file(
     repo: &Repository,
     base_commit: &str,
@@ -1669,12 +1677,15 @@ fn compute_attributions_for_file(
 ) -> Result<Option<(String, String, Vec<Attribution>, Vec<LineAttribution>)>, GitAiError> {
     // Set up blame options
     let mut ai_blame_opts = GitAiBlameOptions::default();
-    ai_blame_opts.no_output = true;
-    ai_blame_opts.return_human_authors_as_human = true;
-    ai_blame_opts.use_prompt_hashes_as_names = true;
-    ai_blame_opts.newest_commit = Some(base_commit.to_string());
-    ai_blame_opts.oldest_commit = blame_start_commit;
-    ai_blame_opts.oldest_date = Some(OLDEST_AI_BLAME_DATE.clone());
+    #[allow(clippy::field_reassign_with_default)]
+    {
+        ai_blame_opts.no_output = true;
+        ai_blame_opts.return_human_authors_as_human = true;
+        ai_blame_opts.use_prompt_hashes_as_names = true;
+        ai_blame_opts.newest_commit = Some(base_commit.to_string());
+        ai_blame_opts.oldest_commit = blame_start_commit;
+        ai_blame_opts.oldest_date = Some(*OLDEST_AI_BLAME_DATE);
+    }
 
     // Run blame at the base commit
     let ai_blame = repo.blame(file_path, &ai_blame_opts);

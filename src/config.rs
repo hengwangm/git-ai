@@ -1,15 +1,16 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use dirs;
 use uuid::Uuid;
 
 use glob::Pattern;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::feature_flags::FeatureFlags;
 use crate::git::repository::Repository;
+use crate::mdm::utils::home_dir;
 
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::RwLock;
@@ -17,10 +18,56 @@ use std::sync::RwLock;
 /// Default API base URL for comparison
 pub const DEFAULT_API_BASE_URL: &str = "https://usegitai.com";
 
+/// Prompt storage mode enum for type-safe handling
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptStorageMode {
+    /// Default mode: prompts uploaded via CAS API, stripped from git notes
+    Default,
+    /// Notes mode: prompts stored in git notes (after secret redaction)
+    Notes,
+    /// Local mode: prompts only stored in local SQLite, never shared
+    Local,
+}
+
+impl PromptStorageMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PromptStorageMode::Default => "default",
+            PromptStorageMode::Notes => "notes",
+            PromptStorageMode::Local => "local",
+        }
+    }
+}
+
+impl std::str::FromStr for PromptStorageMode {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input.trim().to_lowercase().as_str() {
+            "default" => Ok(PromptStorageMode::Default),
+            "notes" => Ok(PromptStorageMode::Notes),
+            "local" => Ok(PromptStorageMode::Local),
+            other => Err(format!("invalid prompt storage mode: '{}'", other)),
+        }
+    }
+}
+
+impl std::fmt::Display for PromptStorageMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Serialize)]
 pub struct Config {
     git_path: String,
+    #[serde(serialize_with = "serialize_patterns")]
     exclude_prompts_in_repositories: Vec<Pattern>,
+    #[serde(serialize_with = "serialize_patterns")]
+    include_prompts_in_repositories: Vec<Pattern>,
+    #[serde(serialize_with = "serialize_patterns")]
     allow_repositories: Vec<Pattern>,
+    #[serde(serialize_with = "serialize_patterns")]
     exclude_repositories: Vec<Pattern>,
     telemetry_oss_disabled: bool,
     telemetry_enterprise_dsn: Option<String>,
@@ -30,11 +77,17 @@ pub struct Config {
     feature_flags: FeatureFlags,
     api_base_url: String,
     prompt_storage: String,
+    default_prompt_storage: Option<String>,
+    #[serde(serialize_with = "serialize_masked_api_key")]
     api_key: Option<String>,
+    quiet: bool,
+    custom_attributes: HashMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum UpdateChannel {
+    #[default]
     Latest,
     Next,
     EnterpriseLatest,
@@ -62,17 +115,14 @@ impl UpdateChannel {
     }
 }
 
-impl Default for UpdateChannel {
-    fn default() -> Self {
-        UpdateChannel::Latest
-    }
-}
 #[derive(Deserialize, Serialize, Default)]
 pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_prompts_in_repositories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_prompts_in_repositories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_repositories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,7 +144,13 @@ pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_prompt_storage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_attributes: Option<HashMap<String, String>>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -117,6 +173,8 @@ pub struct ConfigPatch {
     pub disable_auto_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_attributes: Option<HashMap<String, String>>,
 }
 
 impl Config {
@@ -124,12 +182,12 @@ impl Config {
     /// Safe to call multiple times; subsequent calls are no-ops.
     #[allow(dead_code)]
     pub fn init() {
-        let _ = CONFIG.get_or_init(|| build_config());
+        let _ = CONFIG.get_or_init(build_config);
     }
 
     /// Access the global configuration. Lazily initializes if not already initialized.
     pub fn get() -> &'static Config {
-        CONFIG.get_or_init(|| build_config())
+        CONFIG.get_or_init(build_config)
     }
 
     /// Returns the command to invoke git.
@@ -147,18 +205,22 @@ impl Config {
     }
 
     /// Helper that accepts pre-fetched remotes to avoid multiple git operations
-    fn is_allowed_repository_with_remotes(&self, remotes: Option<&Vec<(String, String)>>) -> bool {
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn is_allowed_repository_with_remotes(
+        &self,
+        remotes: Option<&Vec<(String, String)>>,
+    ) -> bool {
         // First check if repository is in exclusion list - exclusions take precedence
-        if !self.exclude_repositories.is_empty() {
-            if let Some(remotes) = remotes {
-                // If any remote matches the exclusion patterns, deny access
-                if remotes.iter().any(|remote| {
-                    self.exclude_repositories
-                        .iter()
-                        .any(|pattern| pattern.matches(&remote.1))
-                }) {
-                    return false;
-                }
+        if !self.exclude_repositories.is_empty()
+            && let Some(remotes) = remotes
+        {
+            // If any remote matches the exclusion patterns, deny access
+            if remotes.iter().any(|remote| {
+                self.exclude_repositories
+                    .iter()
+                    .any(|pattern| pattern.matches(&remote.1))
+            }) {
+                return false;
             }
         }
 
@@ -258,15 +320,96 @@ impl Config {
         &self.prompt_storage
     }
 
+    /// Returns the effective prompt storage mode for a given repository.
+    ///
+    /// The resolution order is:
+    /// 1. If repo matches exclude_prompts_in_repositories → always "local" (exclusion wins)
+    /// 2. If include_prompts_in_repositories is empty → use prompt_storage (legacy behavior)
+    /// 3. If repo matches include_prompts_in_repositories → use prompt_storage
+    /// 4. If repo doesn't match include list → use default_prompt_storage, or "local" if not set
+    ///
+    /// This enables two use cases:
+    /// - User A: git-ai everywhere, CAS for work repos, notes for others
+    ///   (prompt_storage="default", include_prompts=["positron-ai/*"], default_prompt_storage="notes")
+    /// - User B: git-ai only in work repos (via allow_repositories), CAS there
+    ///   (prompt_storage="default", no include list needed)
+    pub fn effective_prompt_storage(&self, repository: &Option<Repository>) -> PromptStorageMode {
+        // Step 1: Check exclusion list first (deny always wins)
+        if self.should_exclude_prompts(repository) {
+            return PromptStorageMode::Local;
+        }
+
+        // Step 2: If no include list, use the global prompt_storage (legacy behavior)
+        if self.include_prompts_in_repositories.is_empty() {
+            return self
+                .prompt_storage
+                .parse::<PromptStorageMode>()
+                .unwrap_or(PromptStorageMode::Default);
+        }
+
+        // Step 3: Check if repo matches include list
+        let remotes = repository
+            .as_ref()
+            .and_then(|repo| repo.remotes_with_urls().ok());
+
+        let matches_include = match &remotes {
+            Some(remotes) if !remotes.is_empty() => {
+                // Has remotes - check if any match inclusion patterns
+                remotes.iter().any(|remote| {
+                    self.include_prompts_in_repositories
+                        .iter()
+                        .any(|pattern| pattern.matches(&remote.1))
+                })
+            }
+            _ => {
+                // No remotes or no repository - check for wildcard "*" in include patterns
+                self.include_prompts_in_repositories
+                    .iter()
+                    .any(|pattern| pattern.as_str() == "*")
+            }
+        };
+
+        if matches_include {
+            // Step 3a: Repo is in include list → use primary prompt_storage
+            self.prompt_storage
+                .parse::<PromptStorageMode>()
+                .unwrap_or(PromptStorageMode::Default)
+        } else {
+            // Step 4: Repo not in include list → use fallback
+            self.default_prompt_storage
+                .as_ref()
+                .and_then(|s| s.parse::<PromptStorageMode>().ok())
+                .unwrap_or(PromptStorageMode::Local) // Safe default
+        }
+    }
+
     /// Returns the API key if configured
     pub fn api_key(&self) -> Option<&str> {
         self.api_key.as_deref()
+    }
+
+    /// Returns true if quiet mode is enabled (suppresses chart output after commits)
+    pub fn is_quiet(&self) -> bool {
+        self.quiet
+    }
+
+    /// Returns the custom attributes map (from config file + env var override).
+    pub fn custom_attributes(&self) -> &HashMap<String, String> {
+        &self.custom_attributes
+    }
+
+    /// Serialize the effective runtime config into pretty JSON.
+    /// Sensitive values are redacted via field serializers.
+    pub fn to_printable_json_pretty(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize runtime config: {}", e))
     }
 
     /// Override feature flags for testing purposes.
     /// Only available when the `test-support` feature is enabled or in test mode.
     /// Must be `pub` to work with integration tests in the `tests/` directory.
     #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
     pub fn set_test_feature_flags(flags: FeatureFlags) {
         let mut override_flags = TEST_FEATURE_FLAGS_OVERRIDE
             .write()
@@ -278,6 +421,7 @@ impl Config {
     /// Only available when the `test-support` feature is enabled or in test mode.
     /// This should be called in test cleanup to reset to default behavior.
     #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
     pub fn clear_test_feature_flags() {
         let mut override_flags = TEST_FEATURE_FLAGS_OVERRIDE
             .write()
@@ -304,12 +448,37 @@ impl Config {
     }
 }
 
+fn serialize_patterns<S>(patterns: &[Pattern], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let as_strings: Vec<&str> = patterns.iter().map(Pattern::as_str).collect();
+    as_strings.serialize(serializer)
+}
+
+fn serialize_masked_api_key<S>(api_key: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let masked = api_key.as_ref().map(|key| {
+        let chars: Vec<char> = key.chars().collect();
+        if chars.len() > 8 {
+            let prefix: String = chars[..4].iter().collect();
+            let suffix: String = chars[chars.len() - 4..].iter().collect();
+            format!("{}...{}", prefix, suffix)
+        } else {
+            "****".to_string()
+        }
+    });
+    masked.serialize(serializer)
+}
+
 fn build_config() -> Config {
     let file_cfg = load_file_config();
     let exclude_prompts_in_repositories = file_cfg
         .as_ref()
         .and_then(|c| c.exclude_prompts_in_repositories.clone())
-        .unwrap_or(vec![])
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|pattern_str| {
             Pattern::new(&pattern_str)
@@ -322,10 +491,26 @@ fn build_config() -> Config {
                 .ok()
         })
         .collect();
+    let include_prompts_in_repositories = file_cfg
+        .as_ref()
+        .and_then(|c| c.include_prompts_in_repositories.clone())
+        .unwrap_or(vec![])
+        .into_iter()
+        .filter_map(|pattern_str| {
+            Pattern::new(&pattern_str)
+                .map_err(|e| {
+                    eprintln!(
+                        "Warning: Invalid glob pattern in include_prompts_in_repositories '{}': {}",
+                        pattern_str, e
+                    );
+                })
+                .ok()
+        })
+        .collect();
     let allow_repositories = file_cfg
         .as_ref()
         .and_then(|c| c.allow_repositories.clone())
-        .unwrap_or(vec![])
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|pattern_str| {
             Pattern::new(&pattern_str)
@@ -341,7 +526,7 @@ fn build_config() -> Config {
     let exclude_repositories = file_cfg
         .as_ref()
         .and_then(|c| c.exclude_repositories.clone())
-        .unwrap_or(vec![])
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|pattern_str| {
             Pattern::new(&pattern_str)
@@ -366,8 +551,7 @@ fn build_config() -> Config {
 
     // Default to disabled (true) unless this is an OSS build
     // OSS builds set OSS_BUILD env var at compile time to "1", which enables auto-updates by default
-    let auto_update_flags_default_disabled =
-        option_env!("OSS_BUILD").is_none() || option_env!("OSS_BUILD").unwrap() != "1";
+    let auto_update_flags_default_disabled = option_env!("OSS_BUILD") != Some("1");
 
     let disable_version_checks = file_cfg
         .as_ref()
@@ -412,6 +596,23 @@ fn build_config() -> Config {
         }
     };
 
+    // Get default_prompt_storage setting (fallback for repos not in include list)
+    // Valid values: "default", "notes", "local", or None (defaults to "local")
+    let default_prompt_storage = file_cfg
+        .as_ref()
+        .and_then(|c| c.default_prompt_storage.clone())
+        .and_then(|s| {
+            if matches!(s.as_str(), "default" | "notes" | "local") {
+                Some(s)
+            } else {
+                eprintln!(
+                    "Warning: Invalid default_prompt_storage value '{}', ignoring",
+                    s
+                );
+                None
+            }
+        });
+
     // Get API key from env var or config file (env var takes precedence)
     let api_key = env::var("GIT_AI_API_KEY")
         .ok()
@@ -423,11 +624,18 @@ fn build_config() -> Config {
                 .filter(|s| !s.is_empty())
         });
 
+    // Get quiet setting (defaults to false)
+    let quiet = file_cfg.as_ref().and_then(|c| c.quiet).unwrap_or(false);
+
+    // Build custom attributes: file config as base, env var overrides
+    let custom_attributes = build_custom_attributes(&file_cfg);
+
     #[cfg(any(test, feature = "test-support"))]
     {
         let mut config = Config {
             git_path,
             exclude_prompts_in_repositories,
+            include_prompts_in_repositories,
             allow_repositories,
             exclude_repositories,
             telemetry_oss_disabled,
@@ -438,7 +646,10 @@ fn build_config() -> Config {
             feature_flags,
             api_base_url,
             prompt_storage,
+            default_prompt_storage,
             api_key,
+            quiet,
+            custom_attributes: custom_attributes.clone(),
         };
         apply_test_config_patch(&mut config);
         config
@@ -448,6 +659,7 @@ fn build_config() -> Config {
     Config {
         git_path,
         exclude_prompts_in_repositories,
+        include_prompts_in_repositories,
         allow_repositories,
         exclude_repositories,
         telemetry_oss_disabled,
@@ -458,17 +670,64 @@ fn build_config() -> Config {
         feature_flags,
         api_base_url,
         prompt_storage,
+        default_prompt_storage,
         api_key,
+        quiet,
+        custom_attributes,
     }
 }
 
+/// Build custom attributes from file config and `GIT_AI_CUSTOM_ATTRIBUTES` env var.
+/// Env var keys override file config keys on conflict.
+fn build_custom_attributes(file_cfg: &Option<FileConfig>) -> HashMap<String, String> {
+    let mut attrs = file_cfg
+        .as_ref()
+        .and_then(|c| c.custom_attributes.clone())
+        .unwrap_or_default();
+
+    if let Ok(env_val) = env::var("GIT_AI_CUSTOM_ATTRIBUTES") {
+        if let Ok(env_attrs) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&env_val)
+        {
+            for (k, v) in env_attrs {
+                match v {
+                    serde_json::Value::String(s) => {
+                        attrs.insert(k, s);
+                    }
+                    serde_json::Value::Number(n) => {
+                        attrs.insert(k, n.to_string());
+                    }
+                    serde_json::Value::Bool(b) => {
+                        attrs.insert(k, b.to_string());
+                    }
+                    _ => {} // silently drop arrays, objects, null
+                }
+            }
+        } else {
+            crate::utils::debug_log("GIT_AI_CUSTOM_ATTRIBUTES is not valid JSON, ignoring");
+        }
+    }
+
+    attrs
+}
+
 fn build_feature_flags(file_cfg: &Option<FileConfig>) -> FeatureFlags {
-    let file_flags_value = file_cfg.as_ref().and_then(|c| c.feature_flags.as_ref());
+    let mut file_flags_value = file_cfg
+        .as_ref()
+        .and_then(|c| c.feature_flags.as_ref())
+        .cloned();
+
+    // Backward-compatible alias: accept `feature_flags.globalGitHooks` from config files.
+    if let Some(serde_json::Value::Object(ref mut flags)) = file_flags_value
+        && let Some(value) = flags.get("globalGitHooks").cloned()
+        && !flags.contains_key("global_git_hooks")
+    {
+        flags.insert("global_git_hooks".to_string(), value);
+    }
 
     // Try to deserialize the feature flags from the JSON value
     let file_flags = file_flags_value.and_then(|value| {
         // Use from_value to deserialize, but ignore any errors and fall back to defaults
-        serde_json::from_value(value.clone()).ok()
+        serde_json::from_value(value).ok()
     });
 
     FeatureFlags::from_env_and_file(file_flags)
@@ -476,14 +735,14 @@ fn build_feature_flags(file_cfg: &Option<FileConfig>) -> FeatureFlags {
 
 fn resolve_git_path(file_cfg: &Option<FileConfig>) -> String {
     // 1) From config file
-    if let Some(cfg) = file_cfg {
-        if let Some(path) = cfg.git_path.as_ref() {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                let p = Path::new(trimmed);
-                if is_executable(p) {
-                    return trimmed.to_string();
-                }
+    if let Some(cfg) = file_cfg
+        && let Some(path) = cfg.git_path.as_ref()
+    {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let p = Path::new(trimmed);
+            if is_executable(p) {
+                return trimmed.to_string();
             }
         }
     }
@@ -522,31 +781,29 @@ fn resolve_git_path(file_cfg: &Option<FileConfig>) -> String {
 fn load_file_config() -> Option<FileConfig> {
     let path = config_file_path()?;
     let data = fs::read(&path).ok()?;
-    serde_json::from_slice::<FileConfig>(&data).ok()
+    parse_file_config_bytes(&data).ok()
+}
+
+fn parse_file_config_bytes(data: &[u8]) -> Result<FileConfig, serde_json::Error> {
+    // Windows PowerShell 5.1 writes UTF-8 with BOM by default for `Out-File -Encoding UTF8`.
+    // Tolerate BOM-prefixed config files so upgrades/installers don't brick config parsing.
+    let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
+    serde_json::from_slice::<FileConfig>(data)
 }
 
 fn config_file_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".git-ai").join("config.json"))
+    Some(home_dir().join(".git-ai").join("config.json"))
 }
 
 /// Public accessor for config file path
+#[allow(dead_code)]
 pub fn config_file_path_public() -> Option<PathBuf> {
     config_file_path()
 }
 
 /// Returns the path to the git-ai base directory (~/.git-ai)
 pub fn git_ai_dir_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let home = env::var("USERPROFILE").ok()?;
-        Some(Path::new(&home).join(".git-ai"))
-    }
-    #[cfg(not(windows))]
-    {
-        let home = env::var("HOME").ok()?;
-        Some(Path::new(&home).join(".git-ai"))
-    }
+    Some(home_dir().join(".git-ai"))
 }
 
 /// Returns the path to the internal state directory (~/.git-ai/internal)
@@ -623,8 +880,7 @@ pub fn load_file_config_public() -> Result<FileConfig, String> {
 
     let data = fs::read(&path).map_err(|e| format!("Failed to read config file: {}", e))?;
 
-    serde_json::from_slice::<FileConfig>(&data)
-        .map_err(|e| format!("Failed to parse config file: {}", e))
+    parse_file_config_bytes(&data).map_err(|e| format!("Failed to parse config file: {}", e))
 }
 
 /// Save the file config
@@ -657,10 +913,11 @@ fn is_executable(path: &Path) -> bool {
 /// Reads GIT_AI_TEST_CONFIG_PATCH env var containing JSON and applies patches to config
 #[cfg(any(test, feature = "test-support"))]
 fn apply_test_config_patch(config: &mut Config) {
-    if let Ok(patch_json) = env::var("GIT_AI_TEST_CONFIG_PATCH") {
-        if let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json) {
-            if let Some(patterns) = patch.exclude_prompts_in_repositories {
-                config.exclude_prompts_in_repositories = patterns
+    if let Ok(patch_json) = env::var("GIT_AI_TEST_CONFIG_PATCH")
+        && let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json)
+    {
+        if let Some(patterns) = patch.exclude_prompts_in_repositories {
+            config.exclude_prompts_in_repositories = patterns
                     .into_iter()
                     .filter_map(|pattern_str| {
                         Pattern::new(&pattern_str)
@@ -673,27 +930,29 @@ fn apply_test_config_patch(config: &mut Config) {
                             .ok()
                     })
                     .collect();
+        }
+        if let Some(telemetry_oss_disabled) = patch.telemetry_oss_disabled {
+            config.telemetry_oss_disabled = telemetry_oss_disabled;
+        }
+        if let Some(disable_version_checks) = patch.disable_version_checks {
+            config.disable_version_checks = disable_version_checks;
+        }
+        if let Some(disable_auto_updates) = patch.disable_auto_updates {
+            config.disable_auto_updates = disable_auto_updates;
+        }
+        if let Some(prompt_storage) = patch.prompt_storage {
+            // Validate the value
+            if matches!(prompt_storage.as_str(), "default" | "notes" | "local") {
+                config.prompt_storage = prompt_storage;
+            } else {
+                eprintln!(
+                    "Warning: Invalid test prompt_storage value '{}', ignoring",
+                    prompt_storage
+                );
             }
-            if let Some(telemetry_oss_disabled) = patch.telemetry_oss_disabled {
-                config.telemetry_oss_disabled = telemetry_oss_disabled;
-            }
-            if let Some(disable_version_checks) = patch.disable_version_checks {
-                config.disable_version_checks = disable_version_checks;
-            }
-            if let Some(disable_auto_updates) = patch.disable_auto_updates {
-                config.disable_auto_updates = disable_auto_updates;
-            }
-            if let Some(prompt_storage) = patch.prompt_storage {
-                // Validate the value
-                if matches!(prompt_storage.as_str(), "default" | "notes" | "local") {
-                    config.prompt_storage = prompt_storage;
-                } else {
-                    eprintln!(
-                        "Warning: Invalid test prompt_storage value '{}', ignoring",
-                        prompt_storage
-                    );
-                }
-            }
+        }
+        if let Some(custom_attributes) = patch.custom_attributes {
+            config.custom_attributes = custom_attributes;
         }
     }
 }
@@ -709,6 +968,7 @@ mod tests {
         Config {
             git_path: "/usr/bin/git".to_string(),
             exclude_prompts_in_repositories: vec![],
+            include_prompts_in_repositories: vec![],
             allow_repositories: allow_repositories
                 .into_iter()
                 .filter_map(|s| Pattern::new(&s).ok())
@@ -725,7 +985,10 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: "default".to_string(),
+            default_prompt_storage: None,
             api_key: None,
+            quiet: false,
+            custom_attributes: HashMap::new(),
         }
     }
 
@@ -819,6 +1082,7 @@ mod tests {
                 .into_iter()
                 .filter_map(|s| Pattern::new(&s).ok())
                 .collect(),
+            include_prompts_in_repositories: vec![],
             allow_repositories: vec![],
             exclude_repositories: vec![],
             telemetry_oss_disabled: false,
@@ -829,7 +1093,10 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: "default".to_string(),
+            default_prompt_storage: None,
             api_key: None,
+            quiet: false,
+            custom_attributes: HashMap::new(),
         }
     }
 
@@ -857,9 +1124,15 @@ mod tests {
 
         // Test that pattern is compiled correctly
         assert!(!config.exclude_prompts_in_repositories.is_empty());
-        assert!(config.exclude_prompts_in_repositories[0].matches("https://github.com/myorg/repo1"));
-        assert!(config.exclude_prompts_in_repositories[0].matches("https://github.com/myorg/repo2"));
-        assert!(!config.exclude_prompts_in_repositories[0].matches("https://github.com/other/repo"));
+        assert!(
+            config.exclude_prompts_in_repositories[0].matches("https://github.com/myorg/repo1")
+        );
+        assert!(
+            config.exclude_prompts_in_repositories[0].matches("https://github.com/myorg/repo2")
+        );
+        assert!(
+            !config.exclude_prompts_in_repositories[0].matches("https://github.com/other/repo")
+        );
     }
 
     #[test]
@@ -895,13 +1168,199 @@ mod tests {
 
     #[test]
     fn test_should_exclude_prompts_respects_patterns_when_remotes_exist() {
-        let config =
-            create_test_config_with_exclude_prompts(vec!["https://github.com/private/*".to_string()]);
+        let config = create_test_config_with_exclude_prompts(vec![
+            "https://github.com/private/*".to_string(),
+        ]);
 
         // Pattern should match private repos (to exclude)
-        assert!(config.exclude_prompts_in_repositories[0].matches("https://github.com/private/repo"));
+        assert!(
+            config.exclude_prompts_in_repositories[0].matches("https://github.com/private/repo")
+        );
         // Pattern should not match other repos
-        assert!(!config.exclude_prompts_in_repositories[0].matches("https://github.com/public/repo"));
+        assert!(
+            !config.exclude_prompts_in_repositories[0].matches("https://github.com/public/repo")
+        );
+    }
+
+    // Tests for effective_prompt_storage() with include_prompts_in_repositories
+
+    fn create_test_config_with_include_prompts(
+        include_patterns: Vec<String>,
+        exclude_patterns: Vec<String>,
+        prompt_storage: &str,
+        default_prompt_storage: Option<&str>,
+    ) -> Config {
+        Config {
+            git_path: "/usr/bin/git".to_string(),
+            exclude_prompts_in_repositories: exclude_patterns
+                .into_iter()
+                .filter_map(|s| Pattern::new(&s).ok())
+                .collect(),
+            include_prompts_in_repositories: include_patterns
+                .into_iter()
+                .filter_map(|s| Pattern::new(&s).ok())
+                .collect(),
+            allow_repositories: vec![],
+            exclude_repositories: vec![],
+            telemetry_oss_disabled: false,
+            telemetry_enterprise_dsn: None,
+            disable_version_checks: false,
+            disable_auto_updates: false,
+            update_channel: UpdateChannel::Latest,
+            feature_flags: FeatureFlags::default(),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            prompt_storage: prompt_storage.to_string(),
+            default_prompt_storage: default_prompt_storage.map(|s| s.to_string()),
+            api_key: None,
+            quiet: false,
+            custom_attributes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_effective_prompt_storage_no_include_list_uses_global() {
+        // No include list = legacy behavior, use global prompt_storage
+        let config = create_test_config_with_include_prompts(vec![], vec![], "notes", None);
+        assert_eq!(
+            config.effective_prompt_storage(&None),
+            PromptStorageMode::Notes
+        );
+
+        let config = create_test_config_with_include_prompts(vec![], vec![], "local", None);
+        assert_eq!(
+            config.effective_prompt_storage(&None),
+            PromptStorageMode::Local
+        );
+
+        let config = create_test_config_with_include_prompts(vec![], vec![], "default", None);
+        assert_eq!(
+            config.effective_prompt_storage(&None),
+            PromptStorageMode::Default
+        );
+    }
+
+    #[test]
+    fn test_effective_prompt_storage_exclude_always_wins() {
+        // Exclusion with wildcard should always return Local, regardless of include list
+        let config = create_test_config_with_include_prompts(
+            vec!["https://github.com/work/*".to_string()],
+            vec!["*".to_string()], // Exclude everything
+            "default",
+            Some("notes"),
+        );
+        assert_eq!(
+            config.effective_prompt_storage(&None),
+            PromptStorageMode::Local
+        );
+    }
+
+    #[test]
+    fn test_effective_prompt_storage_wildcard_include_matches_no_repo() {
+        // Wildcard include should match repos without remotes (None case)
+        let config = create_test_config_with_include_prompts(
+            vec!["*".to_string()],
+            vec![],
+            "default",
+            Some("notes"),
+        );
+        // With wildcard include and None repo, should use prompt_storage (not fallback)
+        assert_eq!(
+            config.effective_prompt_storage(&None),
+            PromptStorageMode::Default
+        );
+    }
+
+    #[test]
+    fn test_effective_prompt_storage_non_wildcard_include_no_match_uses_fallback() {
+        // Non-wildcard include with None repo = no match, use fallback
+        let config = create_test_config_with_include_prompts(
+            vec!["https://github.com/work/*".to_string()],
+            vec![],
+            "default",
+            Some("notes"),
+        );
+        // None repo can't match non-wildcard pattern, should use default_prompt_storage
+        assert_eq!(
+            config.effective_prompt_storage(&None),
+            PromptStorageMode::Notes
+        );
+    }
+
+    #[test]
+    fn test_effective_prompt_storage_no_fallback_defaults_to_local() {
+        // Non-wildcard include with None repo and no fallback = Local
+        let config = create_test_config_with_include_prompts(
+            vec!["https://github.com/work/*".to_string()],
+            vec![],
+            "default",
+            None, // No fallback configured
+        );
+        // None repo can't match, and no fallback, should default to Local
+        assert_eq!(
+            config.effective_prompt_storage(&None),
+            PromptStorageMode::Local
+        );
+    }
+
+    #[test]
+    fn test_effective_prompt_storage_include_pattern_matching() {
+        let config = create_test_config_with_include_prompts(
+            vec!["https://github.com/positron-ai/*".to_string()],
+            vec![],
+            "default",
+            Some("notes"),
+        );
+
+        // Test that patterns are compiled correctly
+        assert!(!config.include_prompts_in_repositories.is_empty());
+        assert!(
+            config.include_prompts_in_repositories[0]
+                .matches("https://github.com/positron-ai/repo1")
+        );
+        assert!(
+            config.include_prompts_in_repositories[0]
+                .matches("https://github.com/positron-ai/project")
+        );
+        assert!(
+            !config.include_prompts_in_repositories[0].matches("https://github.com/other-org/repo")
+        );
+    }
+
+    #[test]
+    fn test_prompt_storage_mode_from_str() {
+        assert_eq!(
+            "default".parse::<PromptStorageMode>().ok(),
+            Some(PromptStorageMode::Default)
+        );
+        assert_eq!(
+            "DEFAULT".parse::<PromptStorageMode>().ok(),
+            Some(PromptStorageMode::Default)
+        );
+        assert_eq!(
+            "notes".parse::<PromptStorageMode>().ok(),
+            Some(PromptStorageMode::Notes)
+        );
+        assert_eq!(
+            "NOTES".parse::<PromptStorageMode>().ok(),
+            Some(PromptStorageMode::Notes)
+        );
+        assert_eq!(
+            "local".parse::<PromptStorageMode>().ok(),
+            Some(PromptStorageMode::Local)
+        );
+        assert_eq!(
+            "LOCAL".parse::<PromptStorageMode>().ok(),
+            Some(PromptStorageMode::Local)
+        );
+        assert_eq!("invalid".parse::<PromptStorageMode>().ok(), None);
+        assert_eq!("".parse::<PromptStorageMode>().ok(), None);
+    }
+
+    #[test]
+    fn test_prompt_storage_mode_as_str() {
+        assert_eq!(PromptStorageMode::Default.as_str(), "default");
+        assert_eq!(PromptStorageMode::Notes.as_str(), "notes");
+        assert_eq!(PromptStorageMode::Local.as_str(), "local");
     }
 
     #[test]
@@ -937,5 +1396,126 @@ mod tests {
         let channel = UpdateChannel::from_str("enterprise-next").unwrap();
         assert_eq!(channel, UpdateChannel::EnterpriseNext);
         assert_eq!(channel.as_str(), "enterprise-next");
+    }
+
+    #[test]
+    fn test_quiet_default_is_false() {
+        let config = create_test_config(vec![], vec![]);
+        assert!(!config.is_quiet());
+    }
+
+    #[test]
+    fn test_quiet_can_be_enabled() {
+        let mut config = create_test_config(vec![], vec![]);
+        config.quiet = true;
+        assert!(config.is_quiet());
+    }
+
+    #[test]
+    fn test_excluded_repo_with_remotes() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/excluded/repo".to_string(),
+        )];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_allowed_repo_not_excluded_with_remotes() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/allowed/repo".to_string(),
+        )];
+        assert!(config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_allowlist_with_remotes() {
+        let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/myorg/project".to_string(),
+        )];
+        assert!(config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_allowlist_denies_unmatched_remotes() {
+        let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/other/project".to_string(),
+        )];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_exclusion_takes_precedence_with_remotes() {
+        let config = create_test_config(
+            vec!["https://github.com/myorg/*".to_string()],
+            vec!["https://github.com/myorg/secret".to_string()],
+        );
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/myorg/secret".to_string(),
+        )];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_no_remotes_allowed_when_only_excludes() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        assert!(config.is_allowed_repository_with_remotes(None));
+    }
+
+    #[test]
+    fn test_no_remotes_denied_when_allowlist_active() {
+        let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
+        assert!(!config.is_allowed_repository_with_remotes(None));
+    }
+
+    #[test]
+    fn test_empty_remotes_treated_as_no_match_for_exclusion() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes: Vec<(String, String)> = vec![];
+        assert!(config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_multiple_remotes_one_excluded() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes = vec![
+            (
+                "origin".to_string(),
+                "https://github.com/allowed/repo".to_string(),
+            ),
+            (
+                "upstream".to_string(),
+                "https://github.com/excluded/repo".to_string(),
+            ),
+        ];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_parse_file_config_bytes_accepts_utf8_bom() {
+        let mut data = vec![0xEF, 0xBB, 0xBF];
+        data.extend_from_slice(br#"{"git_path":"C:\\Program Files\\Git\\cmd\\git.exe"}"#);
+
+        let parsed = parse_file_config_bytes(&data).expect("BOM-prefixed config should parse");
+        assert_eq!(
+            parsed.git_path.as_deref(),
+            Some(r"C:\Program Files\Git\cmd\git.exe")
+        );
+    }
+
+    #[test]
+    fn test_parse_file_config_bytes_without_bom_still_parses() {
+        let data = br#"{"git_path":"/usr/bin/git"}"#;
+
+        let parsed = parse_file_config_bytes(data).expect("regular config should parse");
+        assert_eq!(parsed.git_path.as_deref(), Some("/usr/bin/git"));
     }
 }

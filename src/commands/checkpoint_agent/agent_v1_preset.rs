@@ -48,7 +48,7 @@ impl AgentCheckpointPreset for AgentV1Preset {
 
         let agent_v1_input: AgentV1Input = serde_json::from_str(&hook_input_json).map_err(|e| {
             crate::error::GitAiError::PresetError(format!(
-                "Invalid AgentV1Input JSON. Format is documented here: https://github.com/acunniffe/git-ai/blob/main/docs/add-your-agent.mdx: \n\n Error: {}",
+                "Invalid AgentV1Input JSON. Format is documented here: https://usegitai.com/docs/cli/add-your-agent: \n\n Error: {}",
                 e
             ))
         })?;
@@ -65,7 +65,7 @@ impl AgentCheckpointPreset for AgentV1Preset {
                     model: "human".to_string(),
                 },
                 agent_metadata: None,
-                will_edit_filepaths: will_edit_filepaths,
+                will_edit_filepaths,
                 checkpoint_kind: CheckpointKind::Human,
                 transcript: None,
                 repo_working_dir: Some(repo_working_dir),
@@ -90,7 +90,7 @@ impl AgentCheckpointPreset for AgentV1Preset {
                 repo_working_dir: Some(repo_working_dir),
                 transcript: Some(transcript),
                 checkpoint_kind: CheckpointKind::AiAgent,
-                edited_filepaths: edited_filepaths,
+                edited_filepaths,
                 will_edit_filepaths: None,
                 dirty_files,
             }),

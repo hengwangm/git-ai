@@ -1,5 +1,5 @@
-use serde_json::Value;
 use dirs;
+use serde_json::Value;
 
 use crate::git::repository::find_repository_in_path;
 
@@ -85,7 +85,7 @@ fn resolve_path_to_remotes(path: &str) -> Result<Vec<String>, String> {
 
 fn print_config_help() {
     eprintln!("git-ai config - View and manage git-ai configuration");
-    eprintln!("");
+    eprintln!();
     eprintln!("Usage:");
     eprintln!("  git-ai config                Show all config as formatted JSON");
     eprintln!("  git-ai config <key>          Show specific config value");
@@ -93,7 +93,7 @@ fn print_config_help() {
     eprintln!("  git-ai config set <key> <value> --add    Add to array (extends existing)");
     eprintln!("  git-ai config --add <key> <value>        Add to array or upsert into object");
     eprintln!("  git-ai config unset <key>    Remove config value (reverts to default)");
-    eprintln!("");
+    eprintln!();
     eprintln!("Configuration Keys:");
     eprintln!("  git_path                     Path to git binary");
     eprintln!("  exclude_prompts_in_repositories  Repos to exclude prompts from (array)");
@@ -107,13 +107,16 @@ fn print_config_help() {
     eprintln!("  feature_flags                Feature flags (object)");
     eprintln!("  api_key                      API key for X-API-Key header");
     eprintln!("  prompt_storage               Prompt storage mode (default/notes/local)");
-    eprintln!("");
+    eprintln!("  include_prompts_in_repositories  Repos to include for prompt storage (array)");
+    eprintln!("  default_prompt_storage       Fallback storage mode for non-included repos");
+    eprintln!("  quiet                        Suppress chart output after commits (bool)");
+    eprintln!();
     eprintln!("Repository Patterns:");
     eprintln!("  For exclude/allow/exclude_prompts_in_repositories, you can provide:");
     eprintln!("    - A glob pattern: \"*\", \"https://github.com/org/*\"");
     eprintln!("    - A URL/git protocol: \"git@github.com:org/repo.git\"");
     eprintln!("    - A file path: \".\" or \"/path/to/repo\" (resolves to repo's remotes)");
-    eprintln!("");
+    eprintln!();
     eprintln!("Examples:");
     eprintln!("  git-ai config exclude_repositories");
     eprintln!("  git-ai config set disable_auto_updates true");
@@ -123,7 +126,7 @@ fn print_config_help() {
     eprintln!("  git-ai config --add allow_repositories ~/projects/my-repo");
     eprintln!("  git-ai config --add feature_flags.my_flag true");
     eprintln!("  git-ai config unset exclude_repositories");
-    eprintln!("");
+    eprintln!();
     std::process::exit(0);
 }
 
@@ -283,6 +286,24 @@ fn show_all_config() -> Result<(), String> {
         Value::String(runtime_config.prompt_storage().to_string()),
     );
 
+    // include_prompts_in_repositories
+    if let Some(ref repos) = file_config.include_prompts_in_repositories {
+        effective_config.insert(
+            "include_prompts_in_repositories".to_string(),
+            serde_json::to_value(repos).unwrap_or(Value::Array(vec![])),
+        );
+    }
+
+    // default_prompt_storage
+    if let Some(ref storage) = file_config.default_prompt_storage {
+        effective_config.insert(
+            "default_prompt_storage".to_string(),
+            Value::String(storage.clone()),
+        );
+    }
+
+    effective_config.insert("quiet".to_string(), Value::Bool(runtime_config.is_quiet()));
+
     // Feature flags - show effective flags with defaults applied
     let flags_value = serde_json::to_value(runtime_config.get_feature_flags())
         .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
@@ -356,6 +377,21 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 }
             }
             "prompt_storage" => Value::String(runtime_config.prompt_storage().to_string()),
+            "include_prompts_in_repositories" => {
+                if let Some(ref repos) = file_config.include_prompts_in_repositories {
+                    serde_json::to_value(repos).unwrap()
+                } else {
+                    Value::Array(vec![])
+                }
+            }
+            "default_prompt_storage" => {
+                if let Some(ref storage) = file_config.default_prompt_storage {
+                    Value::String(storage.clone())
+                } else {
+                    Value::Null
+                }
+            }
+            "quiet" => Value::Bool(runtime_config.is_quiet()),
             _ => return Err(format!("Unknown config key: {}", key)),
         };
 
@@ -384,7 +420,7 @@ fn get_config_value(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!("Nested keys are only supported for feature_flags"))
+    Err("Nested keys are only supported for feature_flags".to_string())
 }
 
 fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String> {
@@ -451,9 +487,9 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
             "update_channel" => {
                 // Validate update channel
                 if value != "latest" && value != "next" {
-                    return Err(format!(
-                        "Invalid update_channel value. Expected 'latest' or 'next'"
-                    ));
+                    return Err(
+                        "Invalid update_channel value. Expected 'latest' or 'next'".to_string()
+                    );
                 }
                 file_config.update_channel = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
@@ -484,6 +520,38 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 file_config.prompt_storage = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
                 eprintln!("[prompt_storage]: {}", value);
+            }
+            "include_prompts_in_repositories" => {
+                let resolved = resolve_repository_value(value)?;
+                if add_mode {
+                    let mut list = file_config
+                        .include_prompts_in_repositories
+                        .unwrap_or_default();
+                    for pattern in &resolved {
+                        if !list.contains(pattern) {
+                            list.push(pattern.clone());
+                        }
+                    }
+                    file_config.include_prompts_in_repositories = Some(list);
+                } else {
+                    file_config.include_prompts_in_repositories = Some(resolved.clone());
+                }
+                crate::config::save_file_config(&file_config)?;
+                for pattern in resolved {
+                    eprintln!("[include_prompts_in_repositories]: {}", pattern);
+                }
+            }
+            "default_prompt_storage" => {
+                validate_prompt_storage_value(value)?;
+                file_config.default_prompt_storage = Some(value.to_string());
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[default_prompt_storage]: {}", value);
+            }
+            "quiet" => {
+                let bool_value = parse_bool(value)?;
+                file_config.quiet = Some(bool_value);
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[quiet]: {}", bool_value);
             }
             _ => return Err(format!("Unknown config key: {}", key)),
         }
@@ -541,7 +609,7 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
         return Ok(());
     }
 
-    Err(format!("Nested keys are only supported for feature_flags"))
+    Err("Nested keys are only supported for feature_flags".to_string())
 }
 
 fn unset_config_value(key: &str) -> Result<(), String> {
@@ -635,6 +703,27 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                     eprintln!("- [prompt_storage]: {}", v);
                 }
             }
+            "include_prompts_in_repositories" => {
+                let old_value = file_config.include_prompts_in_repositories.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [include_prompts_in_repositories]: {:?}", v);
+                }
+            }
+            "default_prompt_storage" => {
+                let old_value = file_config.default_prompt_storage.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [default_prompt_storage]: {}", v);
+                }
+            }
+            "quiet" => {
+                let old_value = file_config.quiet.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [quiet]: {}", v);
+                }
+            }
             _ => return Err(format!("Unknown config key: {}", key)),
         }
 
@@ -695,7 +784,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!("Nested keys are only supported for feature_flags"))
+    Err("Nested keys are only supported for feature_flags".to_string())
 }
 
 fn parse_key_path(key: &str) -> Vec<String> {
@@ -704,9 +793,10 @@ fn parse_key_path(key: &str) -> Vec<String> {
 
 /// Set array field for repository patterns (exclude_repositories, allow_repositories, exclude_prompts_in_repositories)
 /// This function handles the special logic of detecting if a value is:
-/// - A global wildcard pattern like "*"
-/// - A URL or git protocol pattern
-/// - A file path that should be resolved to repository remotes
+///  - A global wildcard pattern like "*"
+///  - A URL or git protocol pattern
+///  - A file path that should be resolved to repository remotes
+///
 /// Returns the values that were added/set for logging purposes
 fn set_repository_array_field(
     field: &mut Option<Vec<String>>,
@@ -772,6 +862,7 @@ fn resolve_repository_value(value: &str) -> Result<Vec<String>, String> {
 
 /// Log array changes with + prefix for add mode, or just list items for set mode
 fn log_array_changes(items: &[String], add_mode: bool) {
+    #[allow(clippy::if_same_then_else)]
     if add_mode {
         for item in items {
             eprintln!("+ {}", item);
@@ -860,5 +951,337 @@ mod tests {
         assert!(err.contains("default"));
         assert!(err.contains("notes"));
         assert!(err.contains("local"));
+    }
+
+    #[test]
+    fn test_parse_bool_valid_true_values() {
+        for value in ["true", "1", "yes", "on", "TRUE", "True", "YES", "ON"] {
+            let result = parse_bool(value);
+            assert!(result.is_ok(), "Expected '{}' to parse as bool", value);
+            assert!(result.unwrap(), "Expected '{}' to be true", value);
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_valid_false_values() {
+        for value in ["false", "0", "no", "off", "FALSE", "False", "NO", "OFF"] {
+            let result = parse_bool(value);
+            assert!(result.is_ok(), "Expected '{}' to parse as bool", value);
+            assert!(!result.unwrap(), "Expected '{}' to be false", value);
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_invalid_value() {
+        let result = parse_bool("invalid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Invalid boolean value"));
+        assert!(err.contains("invalid"));
+    }
+
+    // --- Additional comprehensive tests ---
+
+    #[test]
+    fn test_parse_value_json_string() {
+        let result = parse_value("\"hello\"").unwrap();
+        assert_eq!(result, Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_parse_value_json_number() {
+        let result = parse_value("42").unwrap();
+        assert_eq!(result, Value::Number(serde_json::Number::from(42)));
+    }
+
+    #[test]
+    fn test_parse_value_json_boolean() {
+        let result = parse_value("true").unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_parse_value_json_array() {
+        let result = parse_value("[1,2,3]").unwrap();
+        assert!(result.is_array());
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_value_json_object() {
+        let result = parse_value(r#"{"key":"value"}"#).unwrap();
+        assert!(result.is_object());
+    }
+
+    #[test]
+    fn test_parse_value_plain_string() {
+        let result = parse_value("plain text").unwrap();
+        assert_eq!(result, Value::String("plain text".to_string()));
+    }
+
+    #[test]
+    fn test_mask_api_key_long() {
+        let key = "abcdefghijklmnop";
+        let masked = mask_api_key(key);
+        assert_eq!(masked, "abcd...mnop");
+    }
+
+    #[test]
+    fn test_mask_api_key_short() {
+        let key = "short";
+        let masked = mask_api_key(key);
+        assert_eq!(masked, "****");
+    }
+
+    #[test]
+    fn test_mask_api_key_exactly_eight() {
+        let key = "12345678";
+        let masked = mask_api_key(key);
+        assert_eq!(masked, "****");
+    }
+
+    #[test]
+    fn test_mask_api_key_nine_chars() {
+        let key = "123456789";
+        let masked = mask_api_key(key);
+        assert_eq!(masked, "1234...6789");
+    }
+
+    #[test]
+    fn test_parse_key_path_single() {
+        let result = parse_key_path("key");
+        assert_eq!(result, vec!["key"]);
+    }
+
+    #[test]
+    fn test_parse_key_path_nested() {
+        let result = parse_key_path("parent.child");
+        assert_eq!(result, vec!["parent", "child"]);
+    }
+
+    #[test]
+    fn test_parse_key_path_deeply_nested() {
+        let result = parse_key_path("a.b.c.d");
+        assert_eq!(result, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_parse_key_path_empty() {
+        let result = parse_key_path("");
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn test_detect_pattern_type_global_wildcard() {
+        assert_eq!(detect_pattern_type("*"), PatternType::GlobalWildcard);
+        assert_eq!(detect_pattern_type(" * "), PatternType::GlobalWildcard);
+    }
+
+    #[test]
+    fn test_detect_pattern_type_http_url() {
+        assert_eq!(
+            detect_pattern_type("http://github.com/org/repo"),
+            PatternType::UrlOrGitProtocol
+        );
+        assert_eq!(
+            detect_pattern_type("https://github.com/org/repo"),
+            PatternType::UrlOrGitProtocol
+        );
+    }
+
+    #[test]
+    fn test_detect_pattern_type_git_ssh() {
+        assert_eq!(
+            detect_pattern_type("git@github.com:org/repo.git"),
+            PatternType::UrlOrGitProtocol
+        );
+    }
+
+    #[test]
+    fn test_detect_pattern_type_ssh_url() {
+        assert_eq!(
+            detect_pattern_type("ssh://git@github.com/org/repo"),
+            PatternType::UrlOrGitProtocol
+        );
+    }
+
+    #[test]
+    fn test_detect_pattern_type_git_protocol() {
+        assert_eq!(
+            detect_pattern_type("git://github.com/org/repo"),
+            PatternType::UrlOrGitProtocol
+        );
+    }
+
+    #[test]
+    fn test_detect_pattern_type_wildcard_in_url() {
+        assert_eq!(
+            detect_pattern_type("https://github.com/org/*"),
+            PatternType::UrlOrGitProtocol
+        );
+    }
+
+    #[test]
+    fn test_detect_pattern_type_question_mark_pattern() {
+        assert_eq!(detect_pattern_type("repo-?"), PatternType::UrlOrGitProtocol);
+    }
+
+    #[test]
+    fn test_detect_pattern_type_bracket_pattern() {
+        assert_eq!(
+            detect_pattern_type("[abc]def"),
+            PatternType::UrlOrGitProtocol
+        );
+    }
+
+    #[test]
+    fn test_detect_pattern_type_file_path_relative() {
+        assert_eq!(detect_pattern_type("./path/to/repo"), PatternType::FilePath);
+        assert_eq!(detect_pattern_type("path/to/repo"), PatternType::FilePath);
+    }
+
+    #[test]
+    fn test_detect_pattern_type_file_path_absolute() {
+        assert_eq!(detect_pattern_type("/path/to/repo"), PatternType::FilePath);
+    }
+
+    #[test]
+    fn test_detect_pattern_type_file_path_home() {
+        assert_eq!(detect_pattern_type("~/repo"), PatternType::FilePath);
+    }
+
+    #[test]
+    fn test_detect_pattern_type_single_dot() {
+        assert_eq!(detect_pattern_type("."), PatternType::FilePath);
+    }
+
+    #[test]
+    fn test_detect_pattern_type_double_dot() {
+        assert_eq!(detect_pattern_type(".."), PatternType::FilePath);
+    }
+
+    #[test]
+    fn test_resolve_repository_value_wildcard() {
+        let result = resolve_repository_value("*").unwrap();
+        assert_eq!(result, vec!["*"]);
+    }
+
+    #[test]
+    fn test_resolve_repository_value_url() {
+        let result = resolve_repository_value("https://github.com/org/repo").unwrap();
+        assert_eq!(result, vec!["https://github.com/org/repo"]);
+    }
+
+    #[test]
+    fn test_resolve_repository_value_git_ssh() {
+        let result = resolve_repository_value("git@github.com:org/repo.git").unwrap();
+        assert_eq!(result, vec!["git@github.com:org/repo.git"]);
+    }
+
+    #[test]
+    fn test_log_array_changes_add_mode() {
+        let items = vec!["item1".to_string(), "item2".to_string()];
+        // Just test that it doesn't panic - output goes to stderr
+        log_array_changes(&items, true);
+    }
+
+    #[test]
+    fn test_log_array_changes_set_mode() {
+        let items = vec!["item1".to_string(), "item2".to_string()];
+        // Just test that it doesn't panic - output goes to stderr
+        log_array_changes(&items, false);
+    }
+
+    #[test]
+    fn test_log_array_removals() {
+        let items = vec!["item1".to_string(), "item2".to_string()];
+        // Just test that it doesn't panic - output goes to stderr
+        log_array_removals(&items);
+    }
+
+    #[test]
+    fn test_log_array_changes_empty() {
+        let items: Vec<String> = vec![];
+        log_array_changes(&items, true);
+        log_array_changes(&items, false);
+    }
+
+    #[test]
+    fn test_log_array_removals_empty() {
+        let items: Vec<String> = vec![];
+        log_array_removals(&items);
+    }
+
+    #[test]
+    fn test_parse_bool_case_insensitive() {
+        assert!(parse_bool("TRUE").unwrap());
+        assert!(parse_bool("True").unwrap());
+        assert!(parse_bool("tRuE").unwrap());
+        assert!(!parse_bool("FALSE").unwrap());
+        assert!(!parse_bool("False").unwrap());
+        assert!(!parse_bool("fAlSe").unwrap());
+    }
+
+    #[test]
+    fn test_parse_bool_numeric() {
+        assert!(parse_bool("1").unwrap());
+        assert!(!parse_bool("0").unwrap());
+    }
+
+    #[test]
+    fn test_parse_bool_word_forms() {
+        assert!(parse_bool("yes").unwrap());
+        assert!(parse_bool("YES").unwrap());
+        assert!(parse_bool("on").unwrap());
+        assert!(parse_bool("ON").unwrap());
+        assert!(!parse_bool("no").unwrap());
+        assert!(!parse_bool("NO").unwrap());
+        assert!(!parse_bool("off").unwrap());
+        assert!(!parse_bool("OFF").unwrap());
+    }
+
+    #[test]
+    fn test_parse_bool_invalid_number() {
+        assert!(parse_bool("2").is_err());
+        assert!(parse_bool("-1").is_err());
+    }
+
+    #[test]
+    fn test_parse_bool_empty_string() {
+        assert!(parse_bool("").is_err());
+    }
+
+    #[test]
+    fn test_parse_bool_whitespace() {
+        // Whitespace is not trimmed by parse_bool
+        assert!(parse_bool(" true").is_err());
+        assert!(parse_bool("true ").is_err());
+    }
+
+    #[test]
+    fn test_pattern_type_combinations() {
+        // Test edge cases with @ and : characters
+        assert_eq!(
+            detect_pattern_type("user@host:path"),
+            PatternType::UrlOrGitProtocol
+        );
+        assert_eq!(detect_pattern_type("@:"), PatternType::UrlOrGitProtocol);
+        // @ but no : means file path
+        assert_eq!(detect_pattern_type("file@name"), PatternType::FilePath);
+        // : but no @ means file path (unless absolute)
+        assert_eq!(detect_pattern_type("file:name"), PatternType::FilePath);
+    }
+
+    #[test]
+    fn test_pattern_type_custom_protocols() {
+        assert_eq!(
+            detect_pattern_type("custom://host/path"),
+            PatternType::UrlOrGitProtocol
+        );
+        assert_eq!(
+            detect_pattern_type("ftp://host/path"),
+            PatternType::UrlOrGitProtocol
+        );
     }
 }

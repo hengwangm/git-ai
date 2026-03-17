@@ -12,10 +12,7 @@ use std::process::Command;
 /// Returns the path to the app bundle if found.
 pub fn find_app_by_bundle_id(bundle_id: &str) -> Option<PathBuf> {
     let query = format!("kMDItemCFBundleIdentifier == '{}'", bundle_id);
-    let output = Command::new("mdfind")
-        .arg(&query)
-        .output()
-        .ok()?;
+    let output = Command::new("mdfind").arg(&query).output().ok()?;
 
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout)
@@ -32,6 +29,7 @@ pub fn find_app_by_bundle_id(bundle_id: &str) -> Option<PathBuf> {
 }
 
 /// Check if a preferences domain exists (i.e., has any preferences set).
+#[allow(dead_code)]
 pub fn domain_exists(domain: &str) -> bool {
     Command::new("defaults")
         .args(["read", domain])
@@ -62,6 +60,7 @@ impl Preferences {
     }
 
     /// Check if this preferences domain exists.
+    #[allow(dead_code)]
     pub fn exists(&self) -> bool {
         domain_exists(&self.domain)
     }
@@ -86,6 +85,7 @@ impl Preferences {
     }
 
     /// Read a boolean preference.
+    #[allow(dead_code)]
     pub fn read_bool(&self, key: &str) -> Option<bool> {
         let value = self.read_string(key)?;
         match value.as_str() {
@@ -130,6 +130,7 @@ impl Preferences {
     }
 
     /// Write a boolean preference.
+    #[allow(dead_code)]
     pub fn write_bool(&self, key: &str, value: bool) -> Result<(), GitAiError> {
         let status = Command::new("defaults")
             .args([
@@ -171,6 +172,7 @@ impl Preferences {
     }
 
     /// Get the domain name.
+    #[allow(dead_code)]
     pub fn domain(&self) -> &str {
         &self.domain
     }

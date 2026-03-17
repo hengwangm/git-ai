@@ -5,7 +5,6 @@ mod test_utils;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::TestRepo;
 use rusqlite::{Connection, OpenFlags};
-use serde_json;
 use test_utils::fixture_path;
 
 const TEST_CONVERSATION_ID: &str = "00812842-49fe-4699-afae-bb22cda3f6e1";
@@ -215,7 +214,7 @@ fn test_cursor_preset_multi_root_workspace_detection() {
             let preset = CursorPreset;
             let result = preset
                 .run(flags)
-                .expect(&format!("Should succeed for: {}", description));
+                .unwrap_or_else(|_| panic!("Should succeed for: {}", description));
 
             assert_eq!(
                 result.repo_working_dir,
@@ -326,6 +325,32 @@ fn test_cursor_preset_human_checkpoint_no_filepath() {
 }
 
 #[test]
+fn test_cursor_checkpoint_stdin_with_utf8_bom() {
+    let repo = TestRepo::new();
+    let hook_input = format!(
+        "\u{feff}{}",
+        serde_json::json!({
+            "conversation_id": "test-conversation-id",
+            "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+            "hook_event_name": "beforeSubmitPrompt",
+            "model": "model-name-from-hook-test"
+        })
+    );
+
+    let output = repo
+        .git_ai_with_stdin(
+            &["checkpoint", "cursor", "--hook-input", "stdin"],
+            hook_input.as_bytes(),
+        )
+        .expect("checkpoint should parse stdin payload with UTF-8 BOM");
+
+    assert!(
+        !output.contains("Invalid JSON in hook_input"),
+        "Should not fail JSON parsing when stdin has UTF-8 BOM. Output: {output}"
+    );
+}
+
+#[test]
 fn test_cursor_e2e_with_attribution() {
     use std::fs;
 
@@ -384,13 +409,13 @@ fn test_cursor_e2e_with_attribution() {
 
     // Verify the authorship log contains attestations and prompts
     assert!(
-        commit.authorship_log.attestations.len() > 0,
+        !commit.authorship_log.attestations.is_empty(),
         "Should have at least one attestation"
     );
 
     // Verify the metadata has prompts with transcript data
     assert!(
-        commit.authorship_log.metadata.prompts.len() > 0,
+        !commit.authorship_log.metadata.prompts.is_empty(),
         "Should have at least one prompt record in metadata"
     );
 
@@ -405,7 +430,7 @@ fn test_cursor_e2e_with_attribution() {
 
     // Verify that the prompt record has messages (transcript)
     assert!(
-        prompt_record.messages.len() > 0,
+        !prompt_record.messages.is_empty(),
         "Prompt record should contain messages from the cursor database"
     );
 
@@ -543,13 +568,13 @@ fn test_cursor_e2e_with_resync() {
 
     // Verify the authorship log contains attestations and prompts
     assert!(
-        commit.authorship_log.attestations.len() > 0,
+        !commit.authorship_log.attestations.is_empty(),
         "Should have at least one attestation"
     );
 
     // Verify the metadata has prompts with transcript data
     assert!(
-        commit.authorship_log.metadata.prompts.len() > 0,
+        !commit.authorship_log.metadata.prompts.is_empty(),
         "Should have at least one prompt record in metadata"
     );
 
@@ -573,3 +598,16 @@ fn test_cursor_e2e_with_resync() {
 
     // The temp directory and database will be automatically cleaned up when temp_dir goes out of scope
 }
+
+reuse_tests_in_worktree!(
+    test_can_open_cursor_test_database,
+    test_cursor_database_has_composer_data,
+    test_cursor_database_has_bubble_data,
+    test_fetch_composer_payload_from_test_db,
+    test_fetch_bubble_content_from_test_db,
+    test_extract_transcript_from_test_conversation,
+    test_cursor_preset_multi_root_workspace_detection,
+    test_cursor_preset_human_checkpoint_no_filepath,
+    test_cursor_e2e_with_attribution,
+    test_cursor_e2e_with_resync,
+);

@@ -1,10 +1,11 @@
 use crate::error::GitAiError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 use crate::mdm::utils::{
-    binary_exists, generate_diff, get_binary_version, home_dir, is_git_ai_checkpoint_command,
-    parse_version, version_meets_requirement, write_atomic, MIN_CLAUDE_VERSION,
+    MIN_CLAUDE_VERSION, binary_exists, generate_diff, get_binary_version, home_dir,
+    is_git_ai_checkpoint_command, parse_version, to_git_bash_path, version_meets_requirement,
+    write_atomic,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,17 +43,15 @@ impl HookInstaller for ClaudeCodeInstaller {
         }
 
         // If we have the binary, check version
-        if has_binary {
-            if let Ok(version_str) = get_binary_version("claude") {
-                if let Some(version) = parse_version(&version_str) {
-                    if !version_meets_requirement(version, MIN_CLAUDE_VERSION) {
-                        return Err(GitAiError::Generic(format!(
-                            "Claude Code version {}.{} detected, but minimum version {}.{} is required",
-                            version.0, version.1, MIN_CLAUDE_VERSION.0, MIN_CLAUDE_VERSION.1
-                        )));
-                    }
-                }
-            }
+        if has_binary
+            && let Ok(version_str) = get_binary_version("claude")
+            && let Some(version) = parse_version(&version_str)
+            && !version_meets_requirement(version, MIN_CLAUDE_VERSION)
+        {
+            return Err(GitAiError::Generic(format!(
+                "Claude Code version {}.{} detected, but minimum version {}.{} is required",
+                version.0, version.1, MIN_CLAUDE_VERSION.0, MIN_CLAUDE_VERSION.1
+            )));
         }
 
         // Check if hooks are installed
@@ -99,7 +98,7 @@ impl HookInstaller for ClaudeCodeInstaller {
 
     fn install_hooks(
         &self,
-        _params: &HookInstallerParams,
+        params: &HookInstallerParams,
         dry_run: bool,
     ) -> Result<Option<String>, GitAiError> {
         let settings_path = Self::settings_path();
@@ -123,9 +122,12 @@ impl HookInstaller for ClaudeCodeInstaller {
             serde_json::from_str(&existing_content)?
         };
 
-        // Desired hooks - Claude Code doesn't need absolute paths, uses shell properly
-        let pre_tool_cmd = format!("git-ai {}", CLAUDE_PRE_TOOL_CMD);
-        let post_tool_cmd = format!("git-ai {}", CLAUDE_POST_TOOL_CMD);
+        // Build commands with absolute path
+        // On Windows, Claude Code runs hooks in git bash shell, so we need
+        // paths in MSYS/MinGW format (e.g. /c/Users/... instead of C:\Users\...)
+        let binary_path_str = to_git_bash_path(&params.binary_path);
+        let pre_tool_cmd = format!("{} {}", binary_path_str, CLAUDE_PRE_TOOL_CMD);
+        let post_tool_cmd = format!("{} {}", binary_path_str, CLAUDE_POST_TOOL_CMD);
 
         let desired_hooks = json!({
             "PreToolUse": {
@@ -157,11 +159,11 @@ impl HookInstaller for ClaudeCodeInstaller {
             // Find existing matcher block for Write|Edit|MultiEdit
             let mut found_matcher_idx: Option<usize> = None;
             for (idx, item) in hook_type_array.iter().enumerate() {
-                if let Some(matcher) = item.get("matcher").and_then(|m| m.as_str()) {
-                    if matcher == desired_matcher {
-                        found_matcher_idx = Some(idx);
-                        break;
-                    }
+                if let Some(matcher) = item.get("matcher").and_then(|m| m.as_str())
+                    && matcher == desired_matcher
+                {
+                    found_matcher_idx = Some(idx);
+                    break;
                 }
             }
 
@@ -189,14 +191,13 @@ impl HookInstaller for ClaudeCodeInstaller {
             let mut needs_update = false;
 
             for (idx, hook) in hooks_array.iter().enumerate() {
-                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                    if is_git_ai_checkpoint_command(cmd) {
-                        if found_idx.is_none() {
-                            found_idx = Some(idx);
-                            if cmd != desired_cmd {
-                                needs_update = true;
-                            }
-                        }
+                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
+                    && is_git_ai_checkpoint_command(cmd)
+                    && found_idx.is_none()
+                {
+                    found_idx = Some(idx);
+                    if cmd != desired_cmd {
+                        needs_update = true;
                     }
                 }
             }
@@ -213,7 +214,7 @@ impl HookInstaller for ClaudeCodeInstaller {
                     let keep_idx = idx;
                     let mut current_idx = 0;
                     hooks_array.retain(|hook| {
-                        let should_keep = if current_idx == keep_idx {
+                        if current_idx == keep_idx {
                             current_idx += 1;
                             true
                         } else if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
@@ -223,8 +224,7 @@ impl HookInstaller for ClaudeCodeInstaller {
                         } else {
                             current_idx += 1;
                             true
-                        };
-                        should_keep
+                        }
                     });
                 }
                 None => {
@@ -295,9 +295,14 @@ impl HookInstaller for ClaudeCodeInstaller {
 
         // Remove git-ai checkpoint commands from both PreToolUse and PostToolUse
         for hook_type in &["PreToolUse", "PostToolUse"] {
-            if let Some(hook_type_array) = hooks_obj.get_mut(*hook_type).and_then(|v| v.as_array_mut()) {
+            if let Some(hook_type_array) =
+                hooks_obj.get_mut(*hook_type).and_then(|v| v.as_array_mut())
+            {
                 for matcher_block in hook_type_array.iter_mut() {
-                    if let Some(hooks_array) = matcher_block.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    if let Some(hooks_array) = matcher_block
+                        .get_mut("hooks")
+                        .and_then(|h| h.as_array_mut())
+                    {
                         let original_len = hooks_array.len();
                         hooks_array.retain(|hook| {
                             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
@@ -337,6 +342,7 @@ impl HookInstaller for ClaudeCodeInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mdm::utils::{clean_path, to_git_bash_path};
     use std::fs;
     use tempfile::TempDir;
 
@@ -346,9 +352,14 @@ mod tests {
         (temp_dir, settings_path)
     }
 
+    fn create_test_binary_path() -> PathBuf {
+        PathBuf::from("/usr/local/bin/git-ai")
+    }
+
     #[test]
     fn test_claude_install_hooks_creates_file_from_scratch() {
         let (_temp_dir, settings_path) = setup_test_env();
+        let binary_path = create_test_binary_path();
 
         if let Some(parent) = settings_path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -362,7 +373,7 @@ mod tests {
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": format!("git-ai {}", CLAUDE_PRE_TOOL_CMD)
+                                "command": format!("{} {}", binary_path.display(), CLAUDE_PRE_TOOL_CMD)
                             }
                         ]
                     }
@@ -373,7 +384,7 @@ mod tests {
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": format!("git-ai {}", CLAUDE_POST_TOOL_CMD)
+                                "command": format!("{} {}", binary_path.display(), CLAUDE_POST_TOOL_CMD)
                             }
                         ]
                     }
@@ -381,9 +392,14 @@ mod tests {
             }
         });
 
-        fs::write(&settings_path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&result).unwrap(),
+        )
+        .unwrap();
 
-        let content: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         let hooks = content.get("hooks").unwrap();
 
         let pre_tool = hooks.get("PreToolUse").unwrap().as_array().unwrap();
@@ -445,42 +461,57 @@ mod tests {
             }
         });
 
-        fs::write(&settings_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
 
-        let mut content: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
 
-        let pre_tool_cmd = format!("git-ai {}", CLAUDE_PRE_TOOL_CMD);
-        let post_tool_cmd = format!("git-ai {}", CLAUDE_POST_TOOL_CMD);
+        let binary_path = create_test_binary_path();
+        let pre_tool_cmd = format!("{} {}", binary_path.display(), CLAUDE_PRE_TOOL_CMD);
+        let post_tool_cmd = format!("{} {}", binary_path.display(), CLAUDE_POST_TOOL_CMD);
 
-        for (hook_type, desired_cmd) in &[("PreToolUse", pre_tool_cmd), ("PostToolUse", post_tool_cmd)] {
+        for (hook_type, desired_cmd) in
+            &[("PreToolUse", pre_tool_cmd), ("PostToolUse", post_tool_cmd)]
+        {
             let hooks_obj = content.get_mut("hooks").unwrap();
-            let hook_type_array = hooks_obj.get_mut(*hook_type).unwrap().as_array_mut().unwrap();
+            let hook_type_array = hooks_obj
+                .get_mut(*hook_type)
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
             let matcher_block = &mut hook_type_array[0];
-            let hooks_array = matcher_block.get_mut("hooks").unwrap().as_array_mut().unwrap();
+            let hooks_array = matcher_block
+                .get_mut("hooks")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
 
             let mut found_idx: Option<usize> = None;
             let mut needs_update = false;
 
             for (idx, hook) in hooks_array.iter().enumerate() {
-                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                    if is_git_ai_checkpoint_command(cmd) {
-                        if found_idx.is_none() {
-                            found_idx = Some(idx);
-                            if cmd != *desired_cmd {
-                                needs_update = true;
-                            }
-                        }
+                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
+                    && is_git_ai_checkpoint_command(cmd)
+                    && found_idx.is_none()
+                {
+                    found_idx = Some(idx);
+                    if cmd != *desired_cmd {
+                        needs_update = true;
                     }
                 }
             }
 
-            if let Some(idx) = found_idx {
-                if needs_update {
-                    hooks_array[idx] = json!({
-                        "type": "command",
-                        "command": desired_cmd
-                    });
-                }
+            if let Some(idx) = found_idx
+                && needs_update
+            {
+                hooks_array[idx] = json!({
+                    "type": "command",
+                    "command": desired_cmd
+                });
             }
 
             let first_idx = found_idx;
@@ -500,9 +531,14 @@ mod tests {
             }
         }
 
-        fs::write(&settings_path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&content).unwrap(),
+        )
+        .unwrap();
 
-        let result: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         let hooks = result.get("hooks").unwrap();
 
         for hook_type in &["PreToolUse", "PostToolUse"] {
@@ -554,26 +590,55 @@ mod tests {
             }
         });
 
-        fs::write(&settings_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
 
-        let mut content: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let binary_path = create_test_binary_path();
         let hooks_obj = content.get_mut("hooks").unwrap();
 
-        let pre_array = hooks_obj.get_mut("PreToolUse").unwrap().as_array_mut().unwrap();
-        pre_array[0].get_mut("hooks").unwrap().as_array_mut().unwrap().push(json!({
-            "type": "command",
-            "command": format!("git-ai {}", CLAUDE_PRE_TOOL_CMD)
-        }));
+        let pre_array = hooks_obj
+            .get_mut("PreToolUse")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        pre_array[0]
+            .get_mut("hooks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "type": "command",
+                "command": format!("{} {}", binary_path.display(), CLAUDE_PRE_TOOL_CMD)
+            }));
 
-        let post_array = hooks_obj.get_mut("PostToolUse").unwrap().as_array_mut().unwrap();
-        post_array[0].get_mut("hooks").unwrap().as_array_mut().unwrap().push(json!({
-            "type": "command",
-            "command": format!("git-ai {}", CLAUDE_POST_TOOL_CMD)
-        }));
+        let post_array = hooks_obj
+            .get_mut("PostToolUse")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        post_array[0]
+            .get_mut("hooks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "type": "command",
+                "command": format!("{} {}", binary_path.display(), CLAUDE_POST_TOOL_CMD)
+            }));
 
-        fs::write(&settings_path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&content).unwrap(),
+        )
+        .unwrap();
 
-        let result: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         let hooks = result.get("hooks").unwrap();
 
         let pre_hooks = hooks.get("PreToolUse").unwrap().as_array().unwrap()[0]
@@ -590,7 +655,69 @@ mod tests {
         assert_eq!(pre_hooks.len(), 2);
         assert_eq!(post_hooks.len(), 2);
 
-        assert_eq!(pre_hooks[0].get("command").unwrap().as_str().unwrap(), "echo 'before write'");
-        assert_eq!(post_hooks[0].get("command").unwrap().as_str().unwrap(), "prettier --write");
+        assert_eq!(
+            pre_hooks[0].get("command").unwrap().as_str().unwrap(),
+            "echo 'before write'"
+        );
+        assert_eq!(
+            post_hooks[0].get("command").unwrap().as_str().unwrap(),
+            "prettier --write"
+        );
+    }
+
+    #[test]
+    fn test_claude_hook_commands_no_windows_extended_path_prefix() {
+        let raw_path = PathBuf::from(r"\\?\C:\Users\USERNAME\.git-ai\bin\git-ai.exe");
+        let binary_path = clean_path(raw_path);
+
+        let binary_path_str = to_git_bash_path(&binary_path);
+        let pre_tool_cmd = format!("{} {}", binary_path_str, CLAUDE_PRE_TOOL_CMD);
+        let post_tool_cmd = format!("{} {}", binary_path_str, CLAUDE_POST_TOOL_CMD);
+
+        assert!(
+            !pre_tool_cmd.contains(r"\\?\"),
+            "PreToolUse command should not contain \\\\?\\ prefix, got: {}",
+            pre_tool_cmd
+        );
+        assert!(
+            !post_tool_cmd.contains(r"\\?\"),
+            "PostToolUse command should not contain \\\\?\\ prefix, got: {}",
+            post_tool_cmd
+        );
+        assert!(
+            pre_tool_cmd.contains("checkpoint claude"),
+            "command should still contain checkpoint args"
+        );
+    }
+
+    #[test]
+    fn test_claude_hook_commands_use_git_bash_path_on_windows() {
+        let binary_path = PathBuf::from(r"C:\Users\Administrator\.git-ai\bin\git-ai.exe");
+        let binary_path_str = to_git_bash_path(&binary_path);
+        let pre_tool_cmd = format!("{} {}", binary_path_str, CLAUDE_PRE_TOOL_CMD);
+        let post_tool_cmd = format!("{} {}", binary_path_str, CLAUDE_POST_TOOL_CMD);
+
+        assert_eq!(
+            pre_tool_cmd,
+            "/c/Users/Administrator/.git-ai/bin/git-ai.exe checkpoint claude --hook-input stdin",
+            "PreToolUse command should use git bash path format"
+        );
+        assert_eq!(
+            post_tool_cmd,
+            "/c/Users/Administrator/.git-ai/bin/git-ai.exe checkpoint claude --hook-input stdin",
+            "PostToolUse command should use git bash path format"
+        );
+    }
+
+    #[test]
+    fn test_claude_hook_commands_preserve_unix_path() {
+        let binary_path = PathBuf::from("/usr/local/bin/git-ai");
+        let binary_path_str = to_git_bash_path(&binary_path);
+        let pre_tool_cmd = format!("{} {}", binary_path_str, CLAUDE_PRE_TOOL_CMD);
+
+        assert_eq!(
+            pre_tool_cmd, "/usr/local/bin/git-ai checkpoint claude --hook-input stdin",
+            "Unix paths should be preserved unchanged"
+        );
     }
 }
